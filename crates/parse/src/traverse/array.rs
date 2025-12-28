@@ -1,7 +1,7 @@
 use crate::{
     error::{Error, ErrorKind, Result},
     tokens::{Token, TokenStream, TokenWithContext},
-    traverse::{Visitor, parse_tokens, validate_start_of_value},
+    traverse::{Visitor, parse_tokens_inner, validate_start_of_value},
 };
 use std::ops::Range;
 
@@ -28,6 +28,7 @@ impl<'a> ArrayState<'a> {
         tokens: &mut TokenStream<'a>,
         text: &'a str,
         visitor: &mut impl Visitor<'a>,
+        is_array_value: bool,
     ) -> Result<'a, Self> {
         let next_state = match self {
             ArrayState::Open => match tokens.next_token()? {
@@ -37,7 +38,7 @@ impl<'a> ArrayState<'a> {
                         ..
                     },
                 ) => {
-                    visitor.on_array_open();
+                    visitor.on_array_open(is_array_value);
                     ArrayState::ValueOrEnd { open_ctx }
                 }
                 maybe_token => {
@@ -95,7 +96,7 @@ impl<'a> ArrayState<'a> {
             } => {
                 validate_start_of_value(text, expect_ctx, tokens.peek_token()?.cloned())?;
 
-                let value_range = parse_tokens(tokens, text, false, visitor)?;
+                let value_range = parse_tokens_inner(tokens, text, false, visitor, true)?;
                 ArrayState::CommaOrEnd {
                     open_ctx,
                     last_value_range: value_range,
@@ -150,11 +151,12 @@ pub fn parse_array<'a>(
     tokens: &mut TokenStream<'a>,
     text: &'a str,
     visitor: &mut impl Visitor<'a>,
+    is_array_value: bool,
 ) -> Result<'a, Range<usize>> {
     let mut state = ArrayState::Open;
 
     loop {
-        state = state.process(tokens, text, visitor)?;
+        state = state.process(tokens, text, visitor, is_array_value)?;
         if let ArrayState::End(result) = state {
             break Ok(result);
         }

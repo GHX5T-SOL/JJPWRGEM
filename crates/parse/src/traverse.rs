@@ -11,24 +11,29 @@ use core::ops::Range;
 use std::borrow::Cow;
 
 pub trait Visitor<'a> {
-    fn on_object_open(&mut self);
+    fn on_object_open(&mut self, is_array_value: bool);
     fn on_object_key(&mut self, key: &'a str);
     fn on_object_key_val_delim(&mut self);
     fn on_object_close(&mut self);
-    fn on_array_open(&mut self);
+    fn on_array_open(&mut self, is_array_value: bool);
     fn on_array_close(&mut self);
-    fn on_null(&mut self);
-    fn on_string(&mut self, value: &'a str);
-    fn on_number(&mut self, value: Cow<'a, str>);
-    fn on_boolean(&mut self, value: bool);
+    fn on_null(&mut self, is_array_value: bool);
+    fn on_string(&mut self, value: &'a str, is_array_value: bool);
+    fn on_number(&mut self, value: Cow<'a, str>, is_array_value: bool);
+    fn on_boolean(&mut self, value: bool, is_array_value: bool);
     fn on_item_delim(&mut self);
 }
 
-pub fn parse_tokens<'a>(
+pub fn parse_tokens<'a>(text: &'a str, visitor: &mut impl Visitor<'a>) -> Result<'a, Range<usize>> {
+    parse_tokens_inner(&mut TokenStream::new(text), text, true, visitor, false)
+}
+
+fn parse_tokens_inner<'a>(
     tokens: &mut TokenStream<'a>,
     text: &'a str,
     fail_on_multiple_value: bool,
     visitor: &mut impl Visitor<'a>,
+    is_array_value: bool,
 ) -> Result<'a, Range<usize>> {
     let peeked = tokens.peek_token()?.cloned();
     let Some(peeked) = peeked else {
@@ -39,18 +44,18 @@ pub fn parse_tokens<'a>(
         ));
     };
     let range = match peeked.token {
-        Token::OpenCurlyBrace => parse_object(tokens, text, visitor)?,
-        Token::OpenSquareBracket => parse_array(tokens, text, visitor)?,
+        Token::OpenCurlyBrace => parse_object(tokens, text, visitor, is_array_value)?,
+        Token::OpenSquareBracket => parse_array(tokens, text, visitor, is_array_value)?,
         t if t.is_scalar() => {
             let token_ctx = tokens
                 .next_token()?
                 .expect("peek guaranteed a value for scalar token");
 
             match t {
-                Token::String(s) => visitor.on_string(s),
-                Token::Number(cow) => visitor.on_number(cow),
-                Token::Null => visitor.on_null(),
-                Token::Boolean(b) => visitor.on_boolean(b),
+                Token::String(s) => visitor.on_string(s, is_array_value),
+                Token::Number(cow) => visitor.on_number(cow, is_array_value),
+                Token::Null => visitor.on_null(is_array_value),
+                Token::Boolean(b) => visitor.on_boolean(b, is_array_value),
                 _ => unreachable!("guard prevents non scalars"),
             };
 
@@ -113,33 +118,33 @@ fn join<V, T>(
     }
 }
 
-pub fn parse_value<'a>(val: &'a Value, visitor: &mut impl Visitor<'a>) {
+pub fn parse_value<'a>(val: &'a Value, visitor: &mut impl Visitor<'a>, is_array_value: bool) {
     match val {
-        Value::Null => visitor.on_null(),
-        Value::String(s) => visitor.on_string(s),
-        Value::Number(n) => visitor.on_number(n.clone()),
-        Value::Boolean(b) => visitor.on_boolean(*b),
+        Value::Null => visitor.on_null(is_array_value),
+        Value::String(s) => visitor.on_string(s, is_array_value),
+        Value::Number(n) => visitor.on_number(n.clone(), is_array_value),
+        Value::Boolean(b) => visitor.on_boolean(*b, is_array_value),
         Value::Object(ObjectEntries(items)) => {
-            visitor.on_object_open();
+            visitor.on_object_open(is_array_value);
             join(
                 visitor,
                 items,
                 |visitor, (k, v)| {
-                    visitor.on_string(k);
+                    visitor.on_object_key(k);
                     visitor.on_object_key_val_delim();
-                    parse_value(v, visitor);
+                    parse_value(v, visitor, false);
                 },
                 |visitor, _| visitor.on_item_delim(),
             );
             visitor.on_object_close();
         }
         Value::Array(items) => {
-            visitor.on_array_open();
+            visitor.on_array_open(is_array_value);
             join(
                 visitor,
                 items,
                 |visitor, val| {
-                    parse_value(val, visitor);
+                    parse_value(val, visitor, false);
                 },
                 |visitor, _| visitor.on_item_delim(),
             );

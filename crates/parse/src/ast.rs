@@ -1,4 +1,4 @@
-use crate::{Result, tokens::TokenStream, traverse::parse_tokens};
+use crate::{Result, traverse::parse_tokens};
 use std::borrow::Cow;
 use visitor::AstVisitor;
 
@@ -55,7 +55,7 @@ pub enum Value<'a> {
 
 pub fn parse_str<'a>(json: &'a str) -> Result<'a, Value<'a>> {
     let mut ast = AstVisitor::new();
-    parse_tokens(&mut TokenStream::new(json), json, true, &mut ast)?;
+    parse_tokens(json, &mut ast)?;
     Ok(ast
         .finish()
         .expect("visitor should error if empty or unfinished"))
@@ -120,7 +120,7 @@ mod visitor {
     }
 
     impl<'a> Visitor<'a> for AstVisitor<'a> {
-        fn on_object_open(&mut self) {
+        fn on_object_open(&mut self, _is_array_value: bool) {
             self.stack.push(AstFrame::Object {
                 entries: ObjectEntries::new(),
                 current_key: None,
@@ -147,7 +147,7 @@ mod visitor {
             }
         }
 
-        fn on_array_open(&mut self) {
+        fn on_array_open(&mut self, _is_array_value: bool) {
             self.stack.push(AstFrame::Array { items: Vec::new() });
         }
         fn on_array_close(&mut self) {
@@ -162,19 +162,19 @@ mod visitor {
             }
         }
 
-        fn on_null(&mut self) {
+        fn on_null(&mut self, _is_array_value: bool) {
             self.emit_value(Value::Null);
         }
 
-        fn on_string(&mut self, s: &'a str) {
+        fn on_string(&mut self, s: &'a str, _is_array_value: bool) {
             self.emit_value(Value::String(s));
         }
 
-        fn on_number(&mut self, n: Cow<'a, str>) {
+        fn on_number(&mut self, n: Cow<'a, str>, _is_array_value: bool) {
             self.emit_value(Value::Number(n));
         }
 
-        fn on_boolean(&mut self, b: bool) {
+        fn on_boolean(&mut self, b: bool, _is_array_value: bool) {
             self.emit_value(Value::Boolean(b));
         }
 

@@ -4,8 +4,8 @@ use crate::{
     Result,
     ast::{ObjectEntries, Value},
     format::{Emitter, LineEnding},
-    tokens::{FALSE, NULL, TRUE, TokenStream},
-    traverse::{Visitor, parse_tokens},
+    tokens::{FALSE, NULL, TRUE},
+    traverse::{Visitor, parse_tokens, parse_value},
 };
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -45,14 +45,15 @@ struct CompactEmitter<'a> {
 impl<'a> CompactEmitter<'a> {
     fn emit_event(&mut self, event: Event<'_>) {
         match event {
-            Event::ArrayOpen => self.emit_array_open(),
+            Event::ArrayOpen { .. } => self.emit_array_open(),
             Event::ArrayClose => self.emit_array_close(),
-            Event::ObjectOpen => self.emit_object_open(),
+            Event::ObjectOpen { .. } => self.emit_object_open(),
             Event::ObjectClose => self.emit_object_close(),
-            Event::Null => self.emit_null(),
-            Event::String(s) | Event::ObjectKey(s) => self.emit_string(s),
-            Event::Number(cow) => self.emit_number(&cow),
-            Event::Boolean(b) => self.emit_boolean(b),
+            Event::Null { .. } => self.emit_null(),
+            Event::String { s, .. } => self.emit_string(s),
+            Event::ObjectKey { key } => self.emit_string(key),
+            Event::Number { n, .. } => self.emit_number(&n),
+            Event::Boolean { value, .. } => self.emit_boolean(value),
             Event::ItemDelim => self.emit_item_delim(),
             Event::KeyValDelim => self.emit_key_val_delim(),
         }
@@ -70,6 +71,11 @@ impl Emitter for CompactEmitter<'_> {
     fn emit_key_val_delim(&mut self) {
         self.buf.push(':');
         self.buf.write_key_val_delimiter();
+    }
+
+    fn emit_item_delim(&mut self) {
+        self.buf.push(',');
+        self.buf.push(' ');
     }
 }
 struct ExpandedEmitter<'a> {
@@ -91,12 +97,27 @@ impl Emitter for ExpandedEmitter<'_> {
 }
 impl<'a> ExpandedEmitter<'a> {
     fn emit_event(&mut self, event: Event<'_>, depth: usize) {
+        if event.is_array_value() {
+            let depth = if event.is_scalar() {
+                depth
+            } else {
+                depth.saturating_sub(1)
+            };
+            self.buf.write_indent(depth);
+        }
         match event {
-            Event::ArrayOpen => self.emit_array_open(),
-            Event::ArrayClose => self.emit_array_close(),
-            Event::ObjectOpen => {
+            Event::ArrayOpen { .. } => {
+                self.emit_array_open();
+                self.buf.write_eol();
+            }
+            Event::ObjectOpen { .. } => {
                 self.emit_object_open();
                 self.buf.write_eol();
+            }
+            Event::ArrayClose => {
+                self.buf.write_eol();
+                self.buf.write_indent(depth.saturating_sub(1));
+                self.emit_array_close()
             }
             Event::ObjectClose => {
                 // TODO name consistency, all should be emit
@@ -104,14 +125,14 @@ impl<'a> ExpandedEmitter<'a> {
                 self.buf.write_indent(depth.saturating_sub(1));
                 self.emit_object_close()
             }
-            Event::Null => self.emit_null(),
-            Event::String(s) => self.emit_string(s),
-            Event::ObjectKey(s) => {
+            Event::Null { .. } => self.emit_null(),
+            Event::String { s, .. } => self.emit_string(s),
+            Event::ObjectKey { key } => {
                 self.buf.write_indent(depth);
-                self.emit_string(s)
+                self.emit_string(key)
             }
-            Event::Number(cow) => self.emit_number(&cow),
-            Event::Boolean(b) => self.emit_boolean(b),
+            Event::Number { n, .. } => self.emit_number(&n),
+            Event::Boolean { value, .. } => self.emit_boolean(value),
             Event::ItemDelim => {
                 self.emit_item_delim();
                 self.buf.write_eol();
@@ -120,9 +141,15 @@ impl<'a> ExpandedEmitter<'a> {
         }
     }
 }
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct Level {
+    mode: Option<FormatMode>,
+}
 struct PrettifyEmitVisitor<'a> {
     frames: VecDeque<Frame<'a>>,
-    expansion: Vec<Option<FormatMode>>,
+    levels: Vec<Level>,
+    root_array_level: Option<usize>,
     format_buf: FormatBuf,
 }
 
@@ -130,17 +157,18 @@ impl<'a> PrettifyEmitVisitor<'a> {
     fn new(format_buf: FormatBuf) -> Self {
         Self {
             format_buf,
-            expansion: vec![],
+            levels: vec![],
             frames: VecDeque::new(),
+            root_array_level: None,
         }
     }
 
     fn get_depth(&self) -> usize {
-        self.expansion.len()
+        self.levels.len()
     }
 
     fn flush_buffer(&mut self) {
-        dbg!("buffer flushed");
+        // dbg!("buffer flushed");
         // self.format_buf.buf.reserve(self.buffered_bytes);
         dbg!(&self.frames);
 
@@ -148,17 +176,18 @@ impl<'a> PrettifyEmitVisitor<'a> {
         while let Some(mode) = self.frames.front().and_then(|frame| {
             combine_maybe_mode(
                 frame.mode,
-                self.expansion
+                self.levels
                     .get(frame.depth.saturating_sub(1))
-                    .copied()
-                    .flatten(),
+                    .and_then(|&Level { mode, .. }| mode),
             )
         }) {
+            // dbg!(mode);
             let frame = self.frames.pop_front().unwrap();
+            // dbg!(frame.depth);
 
             for event in frame.events.into_iter() {
-                dbg!(&event);
-                dbg!(&self.expansion);
+                // dbg!(&event);
+                // dbg!(&self.levels);
                 // TODO maybe better to have a general emitter that has two branches???
                 // expansion stack should take precendence over frame
                 match mode {
@@ -194,19 +223,42 @@ impl<'a> PrettifyEmitVisitor<'a> {
         self.frames.push_back(frame);
     }
 
+    fn push_level(&mut self, is_arr_open: bool) {
+        self.levels.push(Level { mode: None });
+        if is_arr_open && self.root_array_level.is_none() {
+            self.root_array_level = Some(self.get_depth());
+        }
+    }
+
+    fn get_level_mode(&self) -> Option<FormatMode> {
+        self.levels
+            .get(self.get_depth().saturating_sub(1))
+            .and_then(|x| x.mode)
+    }
+
     /// Push an event into the current buffer and update remaining width and buffered byte count.
     /// assumes well formed events
     fn on_event(&mut self, event: Event<'a>) {
         match event {
-            Event::ObjectOpen => {
-                self.expansion.push(None);
+            Event::ObjectOpen { .. } => {
+                self.push_level(false);
                 self.push_frame(event);
             }
-            // if we see an open key, commit to formatting expanded
-            Event::ObjectKey(_) => {
-                let frame = self.frames.back_mut().expect("should have an open key");
+            Event::ArrayOpen { .. } => {
+                self.push_level(true);
+                self.push_frame(event);
+            }
+            // if we see an open key, commit to formatting expanded all the way up
+            Event::ObjectKey { .. } => {
+                if self.frames.is_empty() {
+                    self.frames.push_back(Frame::default());
+                }
+                let frame = self.frames.back_mut().unwrap();
                 frame.mode = Some(FormatMode::Expanded);
-                self.expansion[frame.depth.saturating_sub(1)] = Some(FormatMode::Expanded);
+
+                for level in &mut self.levels {
+                    level.mode = Some(FormatMode::Expanded)
+                }
                 let len = self.format_buf.event_len(&event);
                 frame.push(event, len);
 
@@ -215,7 +267,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
             Event::ObjectClose => {
                 let frame = if let Some(frame) = self.frames.back_mut() {
                     let last_event = frame.events.last();
-                    frame.mode = Some(if last_event == Some(&Event::ObjectOpen) {
+                    frame.mode = Some(if matches!(last_event, Some(Event::ObjectOpen { .. })) {
                         FormatMode::Compact
                     } else {
                         FormatMode::Expanded
@@ -232,9 +284,55 @@ impl<'a> PrettifyEmitVisitor<'a> {
 
                 self.flush_buffer();
 
-                self.expansion.pop();
+                self.levels.pop();
             }
-            Event::ArrayClose | Event::ArrayOpen => unimplemented!(),
+            Event::ArrayClose => {
+                self.push_frame(event);
+
+                let is_root = Some(self.get_depth()) == self.root_array_level;
+                if is_root {
+                    let start = self.root_array_level.unwrap();
+                    let mode = combine_maybe_mode(
+                        Some(FormatMode::Compact),
+                        self.levels.get(start).and_then(|x| x.mode),
+                    );
+
+                    for sub_frame in &mut self.frames.iter_mut().skip(start - 1) {
+                        sub_frame.mode = mode;
+                    }
+                }
+
+                let level_mode = self.get_level_mode();
+                let frame = self.frames.back_mut().expect("just pushed");
+
+                frame.mode = level_mode;
+
+                if let Some(level) = self.levels.get_mut(frame.depth - 1) {
+                    level.mode = frame.mode;
+                }
+                dbg!((frame.depth - 1, &self.levels, frame.mode));
+                if frame.mode.is_some() {
+                    self.flush_buffer();
+                    //
+                }
+
+                // TODO how can I track depth if I can't
+                self.levels.pop();
+
+                // how to know when to flush?
+                // if we go over of course
+                // but also after rootmost array
+            }
+            Event::Boolean { is_array_value, .. }
+            | Event::Null { is_array_value }
+            | Event::Number { is_array_value, .. }
+            | Event::String { is_array_value, .. }
+                if is_array_value =>
+            {
+                self.push_frame(event);
+                self.frames.back_mut().unwrap().mode = Some(FormatMode::Compact);
+                self.flush_buffer();
+            }
             _ => {
                 if let Some(frame) = self.frames.back_mut() {
                     let len = self.format_buf.event_len(&event);
@@ -243,11 +341,18 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     self.push_frame(event);
                 }
             }
+        };
+        // if too wide, set all expansion stack to Expanded
+        if self.frames.back().is_none_or(|x| x.bytes_available == 0) {
+            for level in &mut self.levels {
+                level.mode = Some(FormatMode::Expanded)
+            }
+            self.flush_buffer();
         }
     }
 
     pub fn finish(mut self) -> String {
-        dbg!("finished");
+        // dbg!("finished");
         self.flush_buffer();
         self.format_buf.buf
     }
@@ -265,17 +370,72 @@ impl Emitter for PrettifyEmitVisitor<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Event<'a> {
-    ArrayOpen,
+    ArrayOpen {
+        is_array_value: bool,
+    },
     ArrayClose,
-    ObjectOpen,
-    ObjectKey(&'a str),
+    ObjectOpen {
+        is_array_value: bool,
+    },
+    ObjectKey {
+        key: &'a str,
+    },
     ObjectClose,
-    Null,
-    String(&'a str),
-    Number(Cow<'a, str>),
-    Boolean(bool),
+    Null {
+        is_array_value: bool,
+    },
+    String {
+        s: &'a str,
+        is_array_value: bool,
+    },
+    Number {
+        n: Cow<'a, str>,
+        is_array_value: bool,
+    },
+    Boolean {
+        value: bool,
+        is_array_value: bool,
+    },
     ItemDelim,
     KeyValDelim,
+}
+
+impl<'a> Event<'a> {
+    fn is_array_value(&self) -> bool {
+        match self {
+            Event::ArrayOpen { is_array_value }
+            | Event::ObjectOpen { is_array_value }
+            | Event::Null { is_array_value }
+            | Event::String { is_array_value, .. }
+            | Event::Number { is_array_value, .. }
+            | Event::Boolean { is_array_value, .. } => *is_array_value,
+            _ => false,
+        }
+    }
+
+    fn is_scalar(&self) -> bool {
+        matches!(
+            self,
+            Event::Null { .. }
+                | Event::String { .. }
+                | Event::Number { .. }
+                | Event::Boolean { .. }
+        )
+    }
+
+    fn is_array(&self) -> bool {
+        matches!(self, Event::ArrayOpen { .. } | Event::ArrayClose)
+    }
+
+    fn is_object(&self) -> bool {
+        matches!(
+            self,
+            Event::ObjectOpen { .. }
+                | Event::ObjectClose
+                | Event::ObjectKey { .. }
+                | Event::KeyValDelim
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,23 +469,6 @@ struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    fn root(event: Event<'a>, depth: usize) -> Self {
-        Frame {
-            events: vec![event], // TODO sub the len :(
-            depth,
-            ..Default::default()
-        }
-    }
-
-    fn nested(&self, event: Event<'a>) -> Self {
-        Frame {
-            depth: self.depth + 1,
-            bytes_available: self.bytes_available,
-            events: vec![event],
-            ..Default::default()
-        }
-    }
-
     fn push(&mut self, event: Event<'a>, inline_width: usize) -> usize {
         self.events.push(event);
         self.bytes_available = self.bytes_available.saturating_sub(inline_width);
@@ -350,36 +493,39 @@ impl<'a> Frame<'a> {
 [Indent(4), KeyPlusPadding(6), Arr(4)] // when hits end and below preferred width, emit all collapsed
 */
 impl<'a> Visitor<'a> for PrettifyEmitVisitor<'a> {
-    fn on_array_open(&mut self) {
-        self.on_event(Event::ArrayOpen);
+    fn on_array_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ArrayOpen { is_array_value });
     }
 
     fn on_array_close(&mut self) {
         self.on_event(Event::ArrayClose);
     }
 
-    fn on_object_open(&mut self) {
-        self.on_event(Event::ObjectOpen);
+    fn on_object_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ObjectOpen { is_array_value });
     }
 
     fn on_object_close(&mut self) {
         self.on_event(Event::ObjectClose);
     }
 
-    fn on_null(&mut self) {
-        self.on_event(Event::Null);
+    fn on_null(&mut self, is_array_value: bool) {
+        self.on_event(Event::Null { is_array_value });
     }
 
-    fn on_string(&mut self, s: &'a str) {
-        self.on_event(Event::String(s));
+    fn on_string(&mut self, s: &'a str, is_array_value: bool) {
+        self.on_event(Event::String { s, is_array_value });
     }
 
-    fn on_number(&mut self, n: Cow<'a, str>) {
-        self.on_event(Event::Number(n));
+    fn on_number(&mut self, n: Cow<'a, str>, is_array_value: bool) {
+        self.on_event(Event::Number { n, is_array_value });
     }
 
-    fn on_boolean(&mut self, b: bool) {
-        self.on_event(Event::Boolean(b));
+    fn on_boolean(&mut self, b: bool, is_array_value: bool) {
+        self.on_event(Event::Boolean {
+            value: b,
+            is_array_value,
+        });
     }
 
     fn on_item_delim(&mut self) {
@@ -391,7 +537,7 @@ impl<'a> Visitor<'a> for PrettifyEmitVisitor<'a> {
     }
 
     fn on_object_key(&mut self, key: &'a str) {
-        self.on_event(Event::ObjectKey(key));
+        self.on_event(Event::ObjectKey { key });
     }
 }
 
@@ -417,13 +563,6 @@ impl FormatBuf {
     }
     fn push_str(&mut self, value: &str) {
         self.buf.push_str(value);
-    }
-
-    #[inline]
-    fn push_quoted(&mut self, value: &str) {
-        self.push('"');
-        self.push_str(value);
-        self.push('"');
     }
 
     #[inline]
@@ -483,11 +622,12 @@ impl FormatBuf {
     pub fn event_len(&self, event: &Event<'_>) -> usize {
         use Event::*;
         match event {
-            ObjectClose | ArrayOpen | ArrayClose | ObjectOpen => 1,
-            Null => NULL.len(),
-            ObjectKey(s) | String(s) => Self::quoted_len(s),
-            Number(n) => n.len(),
-            Boolean(b) => (if *b { TRUE } else { FALSE }).len(),
+            ObjectClose | ArrayOpen { .. } | ArrayClose | ObjectOpen { .. } => 1,
+            Null { .. } => NULL.len(),
+            ObjectKey { key } => Self::quoted_len(key),
+            String { s, .. } => Self::quoted_len(s),
+            Number { n, .. } => n.len(),
+            Boolean { value, .. } => (if *value { TRUE } else { FALSE }).len(),
             ItemDelim => self.item_delim_len(),
             KeyValDelim => self.key_val_delim_len(),
         }
@@ -514,124 +654,18 @@ pub fn format_str<'a>(
     let buf = FormatBuf::new(String::with_capacity(json.len()), options, preferred_width);
 
     let mut visitor = PrettifyEmitVisitor::new(buf);
-    parse_tokens(&mut TokenStream::new(json), json, true, &mut visitor)?;
+    parse_tokens(json, &mut visitor)?;
 
     Ok(visitor.finish())
 }
 
-/// writes formatted delimiters between formatted items
-///
-/// avoids allocating intermediate `String`s declaratively
-/// # Examples
-/// ```
-/// # use jjpwrgem_parse::format::join_into;
-/// # use std::fmt::Write as _;
-///
-/// let mut buf = String::new();
-/// join_into(&mut buf, [1,2,3,4],
-///     |buf, x| write!(buf, "{}", x * 2).unwrap(),
-///     |buf, _| write!(buf, ",").unwrap(),
-/// );
-/// assert_eq!(buf, "2,4,6,8");
-/// ```
-pub fn join_into<T, B>(
-    buf: &mut B,
-    items: impl IntoIterator<Item = T>,
-    mut item_fmt: impl FnMut(&mut B, &T),
-    mut delim_fmt: impl FnMut(&mut B, &T),
-) {
-    let mut iter = items.into_iter();
-    if let Some(first) = iter.next() {
-        item_fmt(buf, &first);
-        for item in iter {
-            delim_fmt(buf, &item);
-            item_fmt(buf, &item);
-        }
-    }
-}
-
-fn format_value_into(buf: &mut FormatBuf, val: &Value, depth: usize) {
-    match val {
-        Value::Null => buf.push_str(NULL),
-        Value::String(s) => buf.push_quoted(s),
-        Value::Number(s) => buf.push_str(s.as_ref()),
-        Value::Object(entries) if entries.0.is_empty() => buf.push_str("{}"),
-        Value::Object(entries) => {
-            expanded_format_object_into(buf, entries, depth);
-        }
-        Value::Array(items) if items.is_empty() => buf.push_str("[]"),
-        Value::Array(items) => {
-            if len::should_expand(val, buf.available_bytes()) {
-                expanded_format_arr_into(buf, items, depth)
-            } else {
-                compact_format_arr_into(buf, items, depth);
-            }
-        }
-        Value::Boolean(b) => buf.push_str(if *b { TRUE } else { FALSE }),
-    }
-}
-
-fn expanded_format_object_into(buf: &mut FormatBuf, entries: &ObjectEntries, depth: usize) {
-    buf.push('{');
-    buf.write_eol();
-    join_into(
-        buf,
-        entries.0.iter(),
-        |buf, (key, val)| {
-            buf.write_indent(depth + 1);
-            buf.push_quoted(key);
-            buf.push(':');
-            buf.write_key_val_delimiter();
-            format_value_into(buf, val, depth + 1);
-        },
-        |buf, _| {
-            buf.push(',');
-            buf.write_eol();
-        },
-    );
-    buf.write_eol();
-    buf.write_indent(depth);
-    buf.push('}');
-}
-
-fn expanded_format_arr_into(buf: &mut FormatBuf, items: &[Value], depth: usize) {
-    buf.push('[');
-    buf.write_eol();
-    join_into(
-        buf,
-        items,
-        |buf, val| {
-            buf.write_indent(depth + 1);
-            format_value_into(buf, val, depth + 1)
-        },
-        |buf, _| {
-            buf.push(',');
-            buf.write_eol();
-        },
-    );
-    buf.write_eol();
-    buf.write_indent(depth);
-    buf.push(']');
-}
-
-fn compact_format_arr_into(buf: &mut FormatBuf, items: &[Value], depth: usize) {
-    buf.push('[');
-    join_into(
-        buf,
-        items,
-        |buf, val| format_value_into(buf, val, depth + 1),
-        |buf, _| {
-            buf.push(',');
-            buf.write_key_val_delimiter();
-        },
-    );
-    buf.push(']');
-}
-
 pub fn format_value(val: &Value, options: &FormatOptions, preferred_width: usize) -> String {
-    let mut buf = FormatBuf::new(String::new(), *options, preferred_width);
-    format_value_into(&mut buf, val, 0);
-    buf.into_inner()
+    let buf = FormatBuf::new(String::new(), *options, preferred_width);
+    let mut visitor = PrettifyEmitVisitor::new(buf);
+
+    parse_value(val, &mut visitor, false);
+
+    visitor.finish()
 }
 
 pub fn prettify_str(
@@ -644,60 +678,6 @@ pub fn prettify_str(
 
 pub fn prettify_value(val: &Value, preferred_width: usize, line_ending: LineEnding) -> String {
     format_value(val, &FormatOptions::prettify(line_ending), preferred_width)
-}
-
-mod len {
-    use crate::{
-        ast::Value,
-        tokens::{FALSE, NULL, TRUE},
-    };
-
-    /// returns if the inline length of the value > limit or it finds a newline
-    pub fn should_expand(val: &Value, limit: usize) -> bool {
-        try_get_value_len(val, limit).is_none()
-    }
-
-    fn try_get_value_len(val: &Value<'_>, limit: usize) -> Option<usize> {
-        fn within_limit(len: usize, limit: usize) -> bool {
-            len <= limit
-        }
-
-        let len = match val {
-            Value::Null => NULL.len(),
-            Value::String(s) => s.len(),
-            Value::Number(s) => s.len(),
-            Value::Object(entries) => {
-                if entries.is_empty() {
-                    2
-                } else {
-                    return None; // will have a newline
-                }
-            }
-            Value::Array(values) => {
-                let brackets_len = 2;
-                let mut sum = brackets_len;
-                let mut values = values.iter();
-                while let Some(value) = values.next()
-                    && within_limit(sum, limit)
-                {
-                    let remaining = limit.saturating_sub(sum);
-                    let len = try_get_value_len(value, remaining)?;
-                    sum += len;
-                }
-
-                sum
-            }
-            Value::Boolean(b) => {
-                if *b {
-                    TRUE.len()
-                } else {
-                    FALSE.len()
-                }
-            }
-        };
-
-        within_limit(len, limit).then_some(len)
-    }
 }
 
 #[cfg(test)]
@@ -720,6 +700,114 @@ mod tests {
   }
 }
 "#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn formats_arr_compact() {
+        let json = r#"[ "not expanded"]"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(res, r#"["not expanded"]"#.trim());
+    }
+    #[test]
+    fn formats_arr_expanded_due_to_inner() {
+        let json = r#"[ [{"key": "expanded"}]]"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+[
+  [
+    {
+      "key": "expanded"
+    }
+  ]
+]
+            "#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn formats_arr_expanded_due_to_inner_0_preferred() {
+        let json = r#"[ [{"key": "expanded"}]]"#;
+
+        let res = prettify_str(json, 0, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+[
+  [
+    {
+      "key": "expanded"
+    }
+  ]
+]
+            "#
+            .trim()
+        );
+    }
+    #[test]
+    fn formats_arr_expanded_due_to_length() {
+        let json = r#"["hi"]"#;
+
+        let res = prettify_str(json, 0, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+[
+  "hi"
+]
+            "#
+            .trim()
+        );
+    }
+    #[test]
+    fn formats_arr_expanded_due_to_length_long() {
+        let json = r#"[0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006]"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+[
+    0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006
+]
+            "#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn formats_arr_expanded_due_to_length_long_non_scalar() {
+        let json = r#"[[[0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006, {"hi": null},[],{}]]]"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+[
+  [
+    [
+      0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006,
+      {
+        "hi": null
+      },
+      [],
+      {}
+    ]
+  ]
+]
+            "#
             .trim()
         );
     }

@@ -1,7 +1,7 @@
 use crate::{
     Error, ErrorKind, Result,
     tokens::{Token, TokenOption, TokenStream, TokenWithContext},
-    traverse::{Visitor, parse_tokens, validate_start_of_value},
+    traverse::{Visitor, parse_tokens_inner, validate_start_of_value},
 };
 use core::ops::Range;
 
@@ -33,6 +33,7 @@ impl<'a> ObjectState<'a> {
         tokens: &mut TokenStream<'a>,
         text: &'a str,
         visitor: &mut impl Visitor<'a>,
+        is_array_value: bool,
     ) -> Result<'a, Self> {
         let res = match self {
             ObjectState::Open => match tokens.next_token()? {
@@ -42,7 +43,7 @@ impl<'a> ObjectState<'a> {
                         ..
                     },
                 ) => {
-                    visitor.on_object_open();
+                    visitor.on_object_open(is_array_value);
                     ObjectState::KeyOrEnd {
                         open_ctx: ctx,
                         last_pair: None,
@@ -174,7 +175,7 @@ impl<'a> ObjectState<'a> {
             } => {
                 validate_start_of_value(text, colon_ctx.clone(), tokens.peek_token()?.cloned())?;
 
-                let value_range = parse_tokens(tokens, text, false, visitor)?;
+                let value_range = parse_tokens_inner(tokens, text, false, visitor, false)?;
 
                 ObjectState::KeyOrEnd {
                     open_ctx,
@@ -192,11 +193,12 @@ pub fn parse_object<'a>(
     tokens: &mut TokenStream<'a>,
     text: &'a str,
     visitor: &mut impl Visitor<'a>,
+    is_array_value: bool,
 ) -> Result<'a, Range<usize>> {
     let mut state = ObjectState::Open;
 
     loop {
-        state = state.process(tokens, text, visitor)?;
+        state = state.process(tokens, text, visitor, is_array_value)?;
         if let ObjectState::End(range) = state {
             break Ok(range);
         }
