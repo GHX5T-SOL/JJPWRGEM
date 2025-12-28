@@ -168,9 +168,11 @@ impl<'a> PrettifyEmitVisitor<'a> {
     }
 
     fn flush_buffer(&mut self) {
-        // dbg!("buffer flushed");
+        // println!("buffer flushed");
+        // println!();
         // self.format_buf.buf.reserve(self.buffered_bytes);
         // dbg!(&self.frames);
+        // dbg!(&self.levels);
 
         // flush committed frames
         while let Some(mode) = self.frames.front().and_then(|frame| {
@@ -187,7 +189,6 @@ impl<'a> PrettifyEmitVisitor<'a> {
 
             for event in frame.events.into_iter() {
                 // dbg!(&event);
-                // dbg!(&self.levels);
                 // TODO maybe better to have a general emitter that has two branches???
                 // expansion stack should take precendence over frame
                 match mode {
@@ -230,8 +231,9 @@ impl<'a> PrettifyEmitVisitor<'a> {
             return;
         };
 
+        // TODO if statement
         match event.clone() {
-            Event::ArrayOpen { .. } | Event::ObjectOpen { .. } => {
+            Event::ArrayOpen { .. } | Event::ObjectOpen { .. } | Event::ArrayClose => {
                 self.push_frame(event);
             }
             _ if event.is_object() && last_frame.events.iter().any(|x| x.is_array()) => {
@@ -252,6 +254,13 @@ impl<'a> PrettifyEmitVisitor<'a> {
         if is_arr_open && self.root_array_level.is_none() {
             self.root_array_level = Some(self.get_depth());
         }
+    }
+
+    fn pop_level(&mut self) {
+        if self.root_array_level == Some(self.get_depth()) {
+            self.root_array_level.take();
+        }
+        self.levels.pop();
     }
 
     fn get_level_mode(&self) -> Option<FormatMode> {
@@ -279,7 +288,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 let frame = self.frames.back_mut().unwrap();
                 frame.mode = Some(FormatMode::Expanded);
 
-                for level in &mut self.levels {
+                for level in &mut self.levels.iter_mut().take(frame.depth - 1) {
                     level.mode = Some(FormatMode::Expanded)
                 }
 
@@ -287,20 +296,13 @@ impl<'a> PrettifyEmitVisitor<'a> {
             }
             Event::ObjectClose => {
                 self.push_event(event);
-
                 let frame = self.frames.back_mut().expect("just pushed an event");
-                let last_event = frame.events.last();
-                // TODO combine option
-                frame.mode = Some(if matches!(last_event, Some(Event::ObjectOpen { .. })) {
-                    FormatMode::Compact
-                } else {
-                    FormatMode::Expanded
-                });
+                // if mode isn't committed, no keys are here and make it compact
                 frame.mode = Some(frame.mode.unwrap_or(FormatMode::Compact));
 
                 self.flush_buffer();
 
-                self.levels.pop();
+                self.pop_level();
             }
             Event::ArrayClose => {
                 self.push_event(event);
@@ -330,17 +332,22 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 }
 
                 // TODO how can I track depth if I can't
-                self.levels.pop();
+                self.pop_level();
 
                 // how to know when to flush?
                 // if we go over of course
                 // but also after rootmost array
             }
-            Event::Boolean { is_array_value, .. }
-            | Event::Null { is_array_value }
-            | Event::Number { is_array_value, .. }
-            | Event::String { is_array_value, .. } => {
+            Event::Boolean { .. }
+            | Event::Null { .. }
+            | Event::Number { .. }
+            | Event::String { .. } => {
+                let depth = self.get_depth();
                 self.push_event(event);
+                if depth == 0 {
+                    let frame = self.frames.back_mut().unwrap();
+                    frame.mode = Some(FormatMode::Compact);
+                }
             }
             _ => {
                 self.push_event(event);
@@ -356,8 +363,8 @@ impl<'a> PrettifyEmitVisitor<'a> {
     }
 
     pub fn finish(mut self) -> String {
-        // dbg!("finished");
         self.flush_buffer();
+        // debug_assert!(self.frames.is_empty());
         self.format_buf.buf
     }
 }
@@ -480,22 +487,6 @@ impl<'a> Frame<'a> {
     }
 }
 
-// hmmmmm
-// if buffering and found a non empty object, then flush buffer
-// if buffering arr, sub remaining width, if over, then sub width
-// how to reset frame's remaining width???????
-// maybe store a smallvec/stack of the inline width per item
-/*
-{
-    "hi": [1,2,"pretend200long"]
-}
-[Indent(4), KeyPlusPadding(6), Arr(200)] // when hits too long, expand output for all
-
-{
-    "hi": [1,2,[1]]
-}
-[Indent(4), KeyPlusPadding(6), Arr(4)] // when hits end and below preferred width, emit all collapsed
-*/
 impl<'a> Visitor<'a> for PrettifyEmitVisitor<'a> {
     fn on_array_open(&mut self, is_array_value: bool) {
         self.on_event(Event::ArrayOpen { is_array_value });
@@ -811,6 +802,55 @@ mod tests {
     ]
   ]
 ]
+            "#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn obj() {
+        let json = r#"{}"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+        {}
+            "#
+            .trim()
+        );
+    }
+
+    #[test]
+    fn str() {
+        let json = r#"" ""#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+       " " 
+            "#
+            .trim()
+        );
+    }
+    #[test]
+    fn obj2() {
+        let json = r#"{"hi": [], "bye": {"hi":[]}}"#;
+
+        let res = prettify_str(json, 80, LineEnding::Lf).unwrap();
+
+        assert_eq!(
+            res,
+            r#"
+{
+  "hi": [],
+  "bye": {
+      "hi": []
+    }
+}
             "#
             .trim()
         );
