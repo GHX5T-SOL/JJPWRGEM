@@ -2,7 +2,7 @@ use core::iter;
 
 use crate::{
     Result,
-    ast::{ObjectEntries, Value},
+    ast::Value,
     format::{Emitter, LineEnding},
     tokens::{FALSE, NULL, TRUE},
     traverse::{Visitor, parse_tokens, parse_value},
@@ -170,7 +170,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
     fn flush_buffer(&mut self) {
         // dbg!("buffer flushed");
         // self.format_buf.buf.reserve(self.buffered_bytes);
-        dbg!(&self.frames);
+        // dbg!(&self.frames);
 
         // flush committed frames
         while let Some(mode) = self.frames.front().and_then(|frame| {
@@ -223,6 +223,30 @@ impl<'a> PrettifyEmitVisitor<'a> {
         self.frames.push_back(frame);
     }
 
+    /// decides whether event should be in same frame or not
+    fn push_event(&mut self, event: Event<'a>) {
+        let Some(last_frame) = self.frames.back_mut() else {
+            self.push_frame(event);
+            return;
+        };
+
+        match event.clone() {
+            Event::ArrayOpen { .. } | Event::ObjectOpen { .. } => {
+                self.push_frame(event);
+            }
+            _ if event.is_object() && last_frame.events.iter().any(|x| x.is_array()) => {
+                self.push_frame(event);
+            }
+            _ if event.is_array() && last_frame.events.iter().any(|x| x.is_object()) => {
+                self.push_frame(event);
+            }
+            _ => {
+                let len = self.format_buf.event_len(&event);
+                last_frame.push(event, len);
+            }
+        }
+    }
+
     fn push_level(&mut self, is_arr_open: bool) {
         self.levels.push(Level { mode: None });
         if is_arr_open && self.root_array_level.is_none() {
@@ -242,44 +266,36 @@ impl<'a> PrettifyEmitVisitor<'a> {
         match event {
             Event::ObjectOpen { .. } => {
                 self.push_level(false);
-                self.push_frame(event);
+                self.push_event(event);
             }
             Event::ArrayOpen { .. } => {
                 self.push_level(true);
-                self.push_frame(event);
+                self.push_event(event);
             }
             // if we see an open key, commit to formatting expanded all the way up
             Event::ObjectKey { .. } => {
-                if self.frames.is_empty() {
-                    self.frames.push_back(Frame::default());
-                }
+                self.push_event(event);
+
                 let frame = self.frames.back_mut().unwrap();
                 frame.mode = Some(FormatMode::Expanded);
 
                 for level in &mut self.levels {
                     level.mode = Some(FormatMode::Expanded)
                 }
-                let len = self.format_buf.event_len(&event);
-                frame.push(event, len);
 
                 self.flush_buffer();
             }
             Event::ObjectClose => {
-                let frame = if let Some(frame) = self.frames.back_mut() {
-                    let last_event = frame.events.last();
-                    frame.mode = Some(if matches!(last_event, Some(Event::ObjectOpen { .. })) {
-                        FormatMode::Compact
-                    } else {
-                        FormatMode::Expanded
-                    });
-                    // TODO helper
-                    let len = self.format_buf.event_len(&event);
-                    frame.push(event, len);
-                    frame
+                self.push_event(event);
+
+                let frame = self.frames.back_mut().expect("just pushed an event");
+                let last_event = frame.events.last();
+                // TODO combine option
+                frame.mode = Some(if matches!(last_event, Some(Event::ObjectOpen { .. })) {
+                    FormatMode::Compact
                 } else {
-                    self.push_frame(event.clone());
-                    self.frames.back_mut().unwrap()
-                };
+                    FormatMode::Expanded
+                });
                 frame.mode = Some(frame.mode.unwrap_or(FormatMode::Compact));
 
                 self.flush_buffer();
@@ -287,7 +303,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 self.levels.pop();
             }
             Event::ArrayClose => {
-                self.push_frame(event);
+                self.push_event(event);
 
                 let is_root = Some(self.get_depth()) == self.root_array_level;
                 if is_root {
@@ -300,20 +316,17 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     for sub_frame in &mut self.frames.iter_mut().skip(start - 1) {
                         sub_frame.mode = mode;
                     }
-                }
 
-                let level_mode = self.get_level_mode();
-                let frame = self.frames.back_mut().expect("just pushed");
-
-                frame.mode = level_mode;
-
-                if let Some(level) = self.levels.get_mut(frame.depth - 1) {
-                    level.mode = frame.mode;
-                }
-                dbg!((frame.depth - 1, &self.levels, frame.mode));
-                if frame.mode.is_some() {
                     self.flush_buffer();
-                    //
+                } else {
+                    let level_mode = self.get_level_mode();
+                    let frame = self.frames.back_mut().expect("just pushed");
+
+                    frame.mode = level_mode;
+
+                    if let Some(level) = self.levels.get_mut(frame.depth - 1) {
+                        level.mode = frame.mode;
+                    }
                 }
 
                 // TODO how can I track depth if I can't
@@ -326,20 +339,11 @@ impl<'a> PrettifyEmitVisitor<'a> {
             Event::Boolean { is_array_value, .. }
             | Event::Null { is_array_value }
             | Event::Number { is_array_value, .. }
-            | Event::String { is_array_value, .. }
-                if is_array_value =>
-            {
-                self.push_frame(event);
-                self.frames.back_mut().unwrap().mode = Some(FormatMode::Compact);
-                self.flush_buffer();
+            | Event::String { is_array_value, .. } => {
+                self.push_event(event);
             }
             _ => {
-                if let Some(frame) = self.frames.back_mut() {
-                    let len = self.format_buf.event_len(&event);
-                    frame.push(event, len);
-                } else {
-                    self.push_frame(event);
-                }
+                self.push_event(event);
             }
         };
         // if too wide, set all expansion stack to Expanded
