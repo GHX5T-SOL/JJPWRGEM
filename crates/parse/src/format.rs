@@ -1,9 +1,11 @@
+mod depth;
 mod prettify;
 #[cfg(feature = "serde")]
 pub mod serde;
 mod uglify;
 
 use crate::tokens::{FALSE, NULL, TRUE};
+pub use depth::DepthVisitor;
 pub use prettify::{FormatOptions, format_str, format_value, prettify_str, prettify_value};
 pub use uglify::{uglify_str, uglify_value};
 

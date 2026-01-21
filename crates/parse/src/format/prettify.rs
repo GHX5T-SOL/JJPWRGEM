@@ -3,7 +3,7 @@ use core::iter;
 use crate::{
     Result,
     ast::Value,
-    format::{Emitter, LineEnding},
+    format::{DepthVisitor, Emitter, LineEnding},
     tokens::{FALSE, NULL, TRUE},
     traverse::{Visitor, parse_tokens, parse_value},
 };
@@ -35,6 +35,143 @@ impl FormatOptions {
             key_val_delimiter: Some((' ', 1)),
             indent: Some((' ', 2)),
             line_ending,
+        }
+    }
+}
+
+#[allow(dead_code)]
+mod layout {
+    use super::FormatMode;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FrameKind {
+        Object,
+        Array,
+        Scalar,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FrameStats {
+        pub kind: FrameKind,
+        pub inline_len: usize,
+        pub key_count: usize,
+        pub child_expanded: bool,
+        pub is_empty: bool,
+    }
+
+    pub fn decide_layout(stats: FrameStats, preferred_width: usize) -> FormatMode {
+        match stats.kind {
+            FrameKind::Object => {
+                if stats.is_empty {
+                    FormatMode::Compact
+                } else if stats.key_count > 0 {
+                    FormatMode::Expanded
+                } else {
+                    FormatMode::Compact
+                }
+            }
+            FrameKind::Array => {
+                if stats.is_empty {
+                    FormatMode::Compact
+                } else if stats.child_expanded || stats.inline_len > preferred_width {
+                    FormatMode::Expanded
+                } else {
+                    FormatMode::Compact
+                }
+            }
+            FrameKind::Scalar => {
+                if stats.inline_len > preferred_width {
+                    FormatMode::Expanded
+                } else {
+                    FormatMode::Compact
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LayoutDecision {
+        Compact,
+        Expanded,
+    }
+
+    impl From<FormatMode> for LayoutDecision {
+        fn from(value: FormatMode) -> Self {
+            match value {
+                FormatMode::Compact => Self::Compact,
+                FormatMode::Expanded => Self::Expanded,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LayoutFrame {
+        stats: FrameStats,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct LayoutTracker {
+        stack: Vec<LayoutFrame>,
+        preferred_width: usize,
+    }
+
+    impl LayoutTracker {
+        pub fn new(preferred_width: usize) -> Self {
+            Self {
+                stack: Vec::new(),
+                preferred_width,
+            }
+        }
+
+        pub fn open_frame(&mut self, kind: FrameKind) {
+            let stats = FrameStats {
+                kind,
+                inline_len: 0,
+                key_count: 0,
+                child_expanded: false,
+                is_empty: true,
+            };
+            self.stack.push(LayoutFrame { stats });
+        }
+
+        pub fn record_inline_len(&mut self, inline_len: usize) {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.stats.inline_len = frame.stats.inline_len.saturating_add(inline_len);
+            }
+        }
+
+        pub fn mark_non_empty(&mut self) {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.stats.is_empty = false;
+            }
+        }
+
+        pub fn increment_key_count(&mut self) {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.stats.key_count = frame.stats.key_count.saturating_add(1);
+                frame.stats.is_empty = false;
+            }
+        }
+
+        pub fn mark_child_expanded(&mut self) {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.stats.child_expanded = true;
+            }
+        }
+
+        pub fn close_frame(&mut self) -> LayoutDecision {
+            let stats = self
+                .stack
+                .pop()
+                .map(|frame| frame.stats)
+                .unwrap_or(FrameStats {
+                    kind: FrameKind::Scalar,
+                    inline_len: 0,
+                    key_count: 0,
+                    child_expanded: false,
+                    is_empty: true,
+                });
+            decide_layout(stats, self.preferred_width).into()
         }
     }
 }
@@ -142,29 +279,30 @@ impl<'a> ExpandedEmitter<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct Level {
-    mode: Option<FormatMode>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContainerState {
+    id: usize,
+    kind: layout::FrameKind,
+    stats: layout::FrameStats,
 }
+
 struct PrettifyEmitVisitor<'a> {
     frames: VecDeque<Frame<'a>>,
-    levels: Vec<Level>,
-    root_array_level: Option<usize>,
+    containers: Vec<ContainerState>,
+    next_container_id: usize,
     format_buf: FormatBuf,
+    depth: DepthVisitor,
 }
 
 impl<'a> PrettifyEmitVisitor<'a> {
     fn new(format_buf: FormatBuf) -> Self {
         Self {
             format_buf,
-            levels: vec![],
             frames: VecDeque::new(),
-            root_array_level: None,
+            containers: Vec::new(),
+            next_container_id: 1,
+            depth: DepthVisitor::default(),
         }
-    }
-
-    fn get_depth(&self) -> usize {
-        self.levels.len()
     }
 
     fn flush_buffer(&mut self) {
@@ -175,14 +313,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
         // dbg!(&self.levels);
 
         // flush committed frames
-        while let Some(mode) = self.frames.front().and_then(|frame| {
-            combine_maybe_mode(
-                frame.mode,
-                self.levels
-                    .get(frame.depth.saturating_sub(1))
-                    .and_then(|&Level { mode, .. }| mode),
-            )
-        }) {
+        while let Some(mode) = self.frames.front().and_then(|frame| frame.mode) {
             // dbg!(mode);
             let frame = self.frames.pop_front().unwrap();
             // dbg!(frame.depth);
@@ -210,11 +341,12 @@ impl<'a> PrettifyEmitVisitor<'a> {
         }
     }
 
-    fn push_frame(&mut self, event: Event<'a>) {
+    fn push_frame(&mut self, event: Event<'a>, depth: usize, owner_id: usize) {
         let mut frame = Frame {
             events: vec![],
-            depth: self.get_depth(), // snapshot depth
+            depth,                                              // snapshot depth
             bytes_available: self.format_buf.available_bytes(), // is this right here? can we assume everything has been flushed all the way for this line??????
+            owner_id,
             ..Frame::default()
         };
 
@@ -225,22 +357,27 @@ impl<'a> PrettifyEmitVisitor<'a> {
     }
 
     /// decides whether event should be in same frame or not
-    fn push_event(&mut self, event: Event<'a>) {
+    fn push_event(&mut self, event: Event<'a>, depth: usize, owner_id: usize) {
         let Some(last_frame) = self.frames.back_mut() else {
-            self.push_frame(event);
+            self.push_frame(event, depth, owner_id);
             return;
         };
+
+        if last_frame.owner_id != owner_id {
+            self.push_frame(event, depth, owner_id);
+            return;
+        }
 
         // TODO if statement
         match event.clone() {
             Event::ArrayOpen { .. } | Event::ObjectOpen { .. } | Event::ArrayClose => {
-                self.push_frame(event);
+                self.push_frame(event, depth, owner_id);
             }
             _ if event.is_object() && last_frame.events.iter().any(|x| x.is_array()) => {
-                self.push_frame(event);
+                self.push_frame(event, depth, owner_id);
             }
             _ if event.is_array() && last_frame.events.iter().any(|x| x.is_object()) => {
-                self.push_frame(event);
+                self.push_frame(event, depth, owner_id);
             }
             _ => {
                 let len = self.format_buf.event_len(&event);
@@ -249,117 +386,200 @@ impl<'a> PrettifyEmitVisitor<'a> {
         }
     }
 
-    fn push_level(&mut self, is_arr_open: bool) {
-        self.levels.push(Level { mode: None });
-        if is_arr_open && self.root_array_level.is_none() {
-            self.root_array_level = Some(self.get_depth());
+    fn current_container_id(&self) -> usize {
+        self.containers
+            .last()
+            .map(|container| container.id)
+            .unwrap_or(0)
+    }
+
+    fn open_container(&mut self, kind: layout::FrameKind) -> usize {
+        let id = self.next_container_id;
+        self.next_container_id = self.next_container_id.saturating_add(1);
+        let stats = layout::FrameStats {
+            kind,
+            inline_len: 0,
+            key_count: 0,
+            child_expanded: false,
+            is_empty: true,
+        };
+        self.containers.push(ContainerState { id, kind, stats });
+        id
+    }
+
+    fn close_container(&mut self) -> Option<ContainerState> {
+        self.containers.pop()
+    }
+
+    fn record_inline_len(&mut self, inline_len: usize) {
+        if let Some(container) = self.containers.last_mut() {
+            container.stats.inline_len = container.stats.inline_len.saturating_add(inline_len);
         }
     }
 
-    fn pop_level(&mut self) {
-        if self.root_array_level == Some(self.get_depth()) {
-            self.root_array_level.take();
+    fn mark_parent_array_non_empty(&mut self) {
+        if let Some(container) = self
+            .containers
+            .last_mut()
+            .filter(|container| container.kind == layout::FrameKind::Array)
+        {
+            container.stats.is_empty = false;
         }
-        self.levels.pop();
     }
 
-    fn get_level_mode(&self) -> Option<FormatMode> {
-        self.levels
-            .get(self.get_depth().saturating_sub(1))
-            .and_then(|x| x.mode)
+    fn mark_current_array_non_empty(&mut self) {
+        if let Some(container) = self
+            .containers
+            .last_mut()
+            .filter(|container| container.kind == layout::FrameKind::Array)
+        {
+            container.stats.is_empty = false;
+        }
+    }
+
+    fn increment_key_count(&mut self) {
+        if let Some(container) = self.containers.last_mut() {
+            container.stats.key_count = container.stats.key_count.saturating_add(1);
+            container.stats.is_empty = false;
+        }
+    }
+
+    fn mark_current_child_expanded(&mut self) {
+        if let Some(container) = self.containers.last_mut() {
+            container.stats.child_expanded = true;
+        }
+    }
+
+    fn set_container_mode(&mut self, id: usize, mode: FormatMode) {
+        for frame in &mut self.frames {
+            if frame.owner_id == id {
+                frame.mode = Some(mode);
+            }
+        }
+    }
+
+    fn apply_container_layout(&mut self, closed: ContainerState) {
+        let mode = layout::decide_layout(closed.stats, self.format_buf.preferred_width);
+        self.set_container_mode(closed.id, mode);
+
+        if let Some(parent) = self.containers.last_mut() {
+            match mode {
+                FormatMode::Expanded => {
+                    parent.stats.child_expanded = true;
+                }
+                FormatMode::Compact => {
+                    parent.stats.inline_len = parent
+                        .stats
+                        .inline_len
+                        .saturating_add(closed.stats.inline_len);
+                }
+            }
+        }
+    }
+
+    fn update_depth_and_frame_depth(&mut self, event: &Event<'a>) -> (usize, usize) {
+        match event {
+            Event::ArrayOpen { is_array_value } => self.depth.on_array_open(*is_array_value),
+            Event::ArrayClose => self.depth.on_array_close(),
+            Event::ObjectOpen { is_array_value } => self.depth.on_object_open(*is_array_value),
+            Event::ObjectClose => self.depth.on_object_close(),
+            Event::ObjectKey { key } => self.depth.on_object_key(key),
+            Event::KeyValDelim => self.depth.on_object_key_val_delim(),
+            Event::ItemDelim => self.depth.on_item_delim(),
+            Event::Null { is_array_value } => self.depth.on_null(*is_array_value),
+            Event::String { s, is_array_value } => self.depth.on_string(s, *is_array_value),
+            Event::Number { n, is_array_value } => self.depth.on_number(n.clone(), *is_array_value),
+            Event::Boolean {
+                value,
+                is_array_value,
+            } => self.depth.on_boolean(*value, *is_array_value),
+        }
+
+        let current_depth = self.depth.current_depth();
+        let frame_depth = match event {
+            Event::ArrayOpen { .. }
+            | Event::ArrayClose
+            | Event::ObjectOpen { .. }
+            | Event::ObjectClose => current_depth,
+            _ => current_depth.saturating_sub(1),
+        };
+
+        (current_depth, frame_depth)
     }
 
     /// Push an event into the current buffer and update remaining width and buffered byte count.
     /// assumes well formed events
     fn on_event(&mut self, event: Event<'a>) {
+        let (_container_depth, frame_depth) = self.update_depth_and_frame_depth(&event);
+        let event_len = self.format_buf.event_len(&event);
+
         match event {
             Event::ObjectOpen { .. } => {
-                self.push_level(false);
-                self.push_event(event);
+                self.mark_parent_array_non_empty();
+                let owner_id = self.open_container(layout::FrameKind::Object);
+                self.record_inline_len(event_len);
+                self.push_event(event, frame_depth, owner_id);
             }
             Event::ArrayOpen { .. } => {
-                self.push_level(true);
-                self.push_event(event);
+                self.mark_parent_array_non_empty();
+                let owner_id = self.open_container(layout::FrameKind::Array);
+                self.record_inline_len(event_len);
+                self.push_event(event, frame_depth, owner_id);
             }
-            // if we see an open key, commit to formatting expanded all the way up
             Event::ObjectKey { .. } => {
-                self.push_event(event);
-
-                let frame = self.frames.back_mut().unwrap();
-                frame.mode = Some(FormatMode::Expanded);
-
-                for level in &mut self.levels.iter_mut().take(frame.depth - 1) {
-                    level.mode = Some(FormatMode::Expanded)
-                }
-
-                self.flush_buffer();
+                self.record_inline_len(event_len);
+                self.increment_key_count();
+                let owner_id = self.current_container_id();
+                self.push_event(event, frame_depth, owner_id);
             }
             Event::ObjectClose => {
-                self.push_event(event);
-                let frame = self.frames.back_mut().expect("just pushed an event");
-                // if mode isn't committed, no keys are here and make it compact
-                frame.mode = Some(frame.mode.unwrap_or(FormatMode::Compact));
-
-                self.flush_buffer();
-
-                self.pop_level();
+                let owner_id = self.current_container_id();
+                self.record_inline_len(event_len);
+                self.push_event(event, frame_depth, owner_id);
+                if let Some(closed) = self.close_container() {
+                    self.apply_container_layout(closed);
+                }
             }
             Event::ArrayClose => {
-                self.push_event(event);
-
-                let is_root = Some(self.get_depth()) == self.root_array_level;
-                if is_root {
-                    let start = self.root_array_level.unwrap();
-                    let mode = combine_maybe_mode(
-                        Some(FormatMode::Compact),
-                        self.levels.get(start).and_then(|x| x.mode),
-                    );
-
-                    for sub_frame in &mut self.frames.iter_mut().skip(start - 1) {
-                        sub_frame.mode = mode;
-                    }
-
-                    self.flush_buffer();
-                } else {
-                    let level_mode = self.get_level_mode();
-                    let frame = self.frames.back_mut().expect("just pushed");
-
-                    frame.mode = level_mode;
-
-                    if let Some(level) = self.levels.get_mut(frame.depth - 1) {
-                        level.mode = frame.mode;
-                    }
+                let owner_id = self.current_container_id();
+                self.record_inline_len(event_len);
+                self.push_event(event, frame_depth, owner_id);
+                if let Some(closed) = self.close_container() {
+                    self.apply_container_layout(closed);
                 }
-
-                // TODO how can I track depth if I can't
-                self.pop_level();
-
-                // how to know when to flush?
-                // if we go over of course
-                // but also after rootmost array
             }
             Event::Boolean { .. }
             | Event::Null { .. }
             | Event::Number { .. }
             | Event::String { .. } => {
-                let depth = self.get_depth();
-                self.push_event(event);
-                if depth == 0 {
-                    let frame = self.frames.back_mut().unwrap();
-                    frame.mode = Some(FormatMode::Compact);
+                let owner_id = self.current_container_id();
+                self.record_inline_len(event_len);
+                self.mark_current_array_non_empty();
+                if event_len > self.format_buf.preferred_width {
+                    self.mark_current_child_expanded();
+                }
+                self.push_event(event, frame_depth, owner_id);
+
+                if owner_id == 0 {
+                    let stats = layout::FrameStats {
+                        kind: layout::FrameKind::Scalar,
+                        inline_len: event_len,
+                        key_count: 0,
+                        child_expanded: false,
+                        is_empty: false,
+                    };
+                    let mode = layout::decide_layout(stats, self.format_buf.preferred_width);
+                    self.set_container_mode(0, mode);
                 }
             }
-            _ => {
-                self.push_event(event);
+            Event::ItemDelim | Event::KeyValDelim => {
+                let owner_id = self.current_container_id();
+                self.record_inline_len(event_len);
+                self.push_event(event, frame_depth, owner_id);
             }
-        };
-        // if too wide, set all expansion stack to Expanded
-        if self.frames.back().is_none_or(|x| x.bytes_available == 0) {
-            for level in &mut self.levels {
-                level.mode = Some(FormatMode::Expanded)
-            }
-            self.flush_buffer();
         }
+
+        self.flush_buffer();
     }
 
     pub fn finish(mut self) -> String {
@@ -455,28 +675,13 @@ enum FormatMode {
     Expanded,
 }
 
-impl FormatMode {
-    /// chains 2 modes
-    /// returns `self` when `Expanded`, else returns `other`
-    fn then(self, other: Self) -> Self {
-        match self {
-            FormatMode::Compact => other,
-            FormatMode::Expanded => self,
-        }
-    }
-}
-
-fn combine_maybe_mode(x: Option<FormatMode>, y: Option<FormatMode>) -> Option<FormatMode> {
-    x.zip(y).map(|(x, y)| x.then(y)).or(x).or(y)
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Frame<'a> {
     mode: Option<FormatMode>,
-    parent_mode: Option<FormatMode>,
     events: Vec<Event<'a>>,
     depth: usize,
     bytes_available: usize,
+    owner_id: usize,
 }
 
 impl<'a> Frame<'a> {
@@ -543,6 +748,7 @@ struct FormatBuf {
     preferred_width: usize,
 }
 
+#[allow(dead_code)]
 impl FormatBuf {
     fn new(buf: String, opts: FormatOptions, preferred_width: usize) -> Self {
         Self {
@@ -596,11 +802,6 @@ impl FormatBuf {
     }
 
     #[inline]
-    pub fn indent_len(&self, level: usize) -> usize {
-        self.opts.indent.map(|(_, size)| size * level).unwrap_or(0)
-    }
-
-    #[inline]
     pub fn key_val_delim_len(&self) -> usize {
         // colon + optional spec
         1 + self.spec_len(self.opts.key_val_delimiter)
@@ -626,10 +827,6 @@ impl FormatBuf {
             ItemDelim => self.item_delim_len(),
             KeyValDelim => self.key_val_delim_len(),
         }
-    }
-
-    fn into_inner(self) -> String {
-        self.buf
     }
 
     pub fn column(&self) -> usize {
@@ -677,7 +874,9 @@ pub fn prettify_value(val: &Value, preferred_width: usize, line_ending: LineEndi
 
 #[cfg(test)]
 mod tests {
+    use super::layout::{FrameKind, FrameStats, LayoutDecision, LayoutTracker, decide_layout};
     use super::*;
+    use crate::traverse::parse_tokens;
 
     #[test]
     fn formats_object() {
@@ -848,11 +1047,228 @@ mod tests {
 {
   "hi": [],
   "bye": {
-      "hi": []
-    }
+    "hi": []
+  }
 }
             "#
             .trim()
+        );
+    }
+
+    #[test]
+    fn layout_object_with_keys_expands() {
+        let stats = FrameStats {
+            kind: FrameKind::Object,
+            inline_len: 10,
+            key_count: 1,
+            child_expanded: false,
+            is_empty: false,
+        };
+
+        assert_eq!(decide_layout(stats, 80), FormatMode::Expanded);
+    }
+
+    #[test]
+    fn layout_empty_object_is_compact() {
+        let stats = FrameStats {
+            kind: FrameKind::Object,
+            inline_len: 2,
+            key_count: 0,
+            child_expanded: false,
+            is_empty: true,
+        };
+
+        assert_eq!(decide_layout(stats, 0), FormatMode::Compact);
+    }
+
+    #[test]
+    fn layout_array_expands_on_child_or_width() {
+        let child_expanded = FrameStats {
+            kind: FrameKind::Array,
+            inline_len: 4,
+            key_count: 0,
+            child_expanded: true,
+            is_empty: false,
+        };
+        let width_overflow = FrameStats {
+            kind: FrameKind::Array,
+            inline_len: 10,
+            key_count: 0,
+            child_expanded: false,
+            is_empty: false,
+        };
+
+        assert_eq!(decide_layout(child_expanded, 80), FormatMode::Expanded);
+        assert_eq!(decide_layout(width_overflow, 5), FormatMode::Expanded);
+    }
+
+    #[test]
+    fn layout_empty_array_is_compact() {
+        let stats = FrameStats {
+            kind: FrameKind::Array,
+            inline_len: 2,
+            key_count: 0,
+            child_expanded: false,
+            is_empty: true,
+        };
+
+        assert_eq!(decide_layout(stats, 0), FormatMode::Compact);
+    }
+
+    #[test]
+    fn layout_scalar_expands_on_width_overflow() {
+        let stats = FrameStats {
+            kind: FrameKind::Scalar,
+            inline_len: 10,
+            key_count: 0,
+            child_expanded: false,
+            is_empty: false,
+        };
+
+        assert_eq!(decide_layout(stats, 5), FormatMode::Expanded);
+        assert_eq!(decide_layout(stats, 20), FormatMode::Compact);
+    }
+
+    #[test]
+    fn layout_tracker_marks_object_keys_expanded() {
+        let mut tracker = LayoutTracker::new(80);
+        tracker.open_frame(FrameKind::Object);
+        tracker.record_inline_len(1);
+        tracker.mark_non_empty();
+        tracker.increment_key_count();
+        let decision = tracker.close_frame();
+
+        assert_eq!(decision, LayoutDecision::Expanded);
+    }
+
+    #[test]
+    fn layout_tracker_array_inherits_child_expansion() {
+        let mut tracker = LayoutTracker::new(80);
+        tracker.open_frame(FrameKind::Array);
+        tracker.mark_child_expanded();
+        let decision = tracker.close_frame();
+
+        assert_eq!(decision, LayoutDecision::Expanded);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CaptureEventKind {
+        ObjectOpen,
+        ObjectKey,
+        ObjectKeyValDelim,
+        ObjectClose,
+        ArrayOpen,
+        ArrayClose,
+        Null,
+        String,
+        Number,
+        Boolean,
+        ItemDelim,
+    }
+
+    #[derive(Debug)]
+    struct CaptureVisitor<V, T, F> {
+        inner: V,
+        items: Vec<T>,
+        map: F,
+    }
+
+    impl<V, T, F> CaptureVisitor<V, T, F>
+    where
+        F: FnMut(&V, CaptureEventKind) -> T,
+    {
+        fn new(inner: V, map: F) -> Self {
+            Self {
+                inner,
+                items: Vec::new(),
+                map,
+            }
+        }
+
+        fn push(&mut self, kind: CaptureEventKind) {
+            let item = (self.map)(&self.inner, kind);
+            self.items.push(item);
+        }
+    }
+
+    impl<'a, V, T, F> Visitor<'a> for CaptureVisitor<V, T, F>
+    where
+        V: Visitor<'a>,
+        F: FnMut(&V, CaptureEventKind) -> T,
+    {
+        fn on_object_open(&mut self, is_array_value: bool) {
+            self.inner.on_object_open(is_array_value);
+            self.push(CaptureEventKind::ObjectOpen);
+        }
+
+        fn on_object_key(&mut self, key: &'a str) {
+            self.inner.on_object_key(key);
+            self.push(CaptureEventKind::ObjectKey);
+        }
+
+        fn on_object_key_val_delim(&mut self) {
+            self.inner.on_object_key_val_delim();
+            self.push(CaptureEventKind::ObjectKeyValDelim);
+        }
+
+        fn on_object_close(&mut self) {
+            self.inner.on_object_close();
+            self.push(CaptureEventKind::ObjectClose);
+        }
+
+        fn on_array_open(&mut self, is_array_value: bool) {
+            self.inner.on_array_open(is_array_value);
+            self.push(CaptureEventKind::ArrayOpen);
+        }
+
+        fn on_array_close(&mut self) {
+            self.inner.on_array_close();
+            self.push(CaptureEventKind::ArrayClose);
+        }
+
+        fn on_null(&mut self, is_array_value: bool) {
+            self.inner.on_null(is_array_value);
+            self.push(CaptureEventKind::Null);
+        }
+
+        fn on_string(&mut self, value: &'a str, is_array_value: bool) {
+            self.inner.on_string(value, is_array_value);
+            self.push(CaptureEventKind::String);
+        }
+
+        fn on_number(&mut self, value: Cow<'a, str>, is_array_value: bool) {
+            self.inner.on_number(value, is_array_value);
+            self.push(CaptureEventKind::Number);
+        }
+
+        fn on_boolean(&mut self, value: bool, is_array_value: bool) {
+            self.inner.on_boolean(value, is_array_value);
+            self.push(CaptureEventKind::Boolean);
+        }
+
+        fn on_item_delim(&mut self) {
+            self.inner.on_item_delim();
+            self.push(CaptureEventKind::ItemDelim);
+        }
+    }
+
+    #[test]
+    fn capture_visitor_records_event_kinds() {
+        let json = r#"{"hi":[1]}"#;
+        let mut visitor = CaptureVisitor::new(DepthVisitor::default(), |_, kind| kind);
+        parse_tokens(json, &mut visitor).unwrap();
+
+        assert_eq!(
+            visitor.items,
+            vec![
+                CaptureEventKind::ObjectOpen,
+                CaptureEventKind::ObjectKey,
+                CaptureEventKind::ObjectKeyValDelim,
+                CaptureEventKind::ArrayOpen,
+                CaptureEventKind::Number,
+                CaptureEventKind::ArrayClose,
+                CaptureEventKind::ObjectClose,
+            ]
         );
     }
 }
