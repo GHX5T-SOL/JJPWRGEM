@@ -8,7 +8,7 @@ use crate::{
     traverse::{Visitor, parse_tokens, parse_value},
 };
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::mem;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct FormatOptions {
@@ -311,7 +311,8 @@ struct ContainerState {
 }
 
 struct PrettifyEmitVisitor<'a> {
-    frames: VecDeque<Frame<'a>>,
+    frames: Vec<Frame<'a>>,
+    frame_head: usize,
     event_pool: Vec<Vec<Event<'a>>>,
     containers: Vec<ContainerState>,
     next_container_id: usize,
@@ -325,7 +326,8 @@ impl<'a> PrettifyEmitVisitor<'a> {
         let preferred_width = format_buf.preferred_width;
         Self {
             format_buf,
-            frames: VecDeque::new(),
+            frames: Vec::new(),
+            frame_head: 0,
             event_pool: Vec::new(),
             containers: Vec::new(),
             next_container_id: 1,
@@ -336,17 +338,25 @@ impl<'a> PrettifyEmitVisitor<'a> {
 
     fn flush_buffer(&mut self) {
         // flush committed frames
-        while let Some(mode) = self.frames.front().and_then(|frame| frame.mode) {
-            let frame = self.frames.pop_front().unwrap();
+        while self
+            .frames
+            .get(self.frame_head)
+            .and_then(|frame| frame.mode)
+            .is_some()
+        {
+            let frame = &mut self.frames[self.frame_head];
+            self.frame_head = self.frame_head.saturating_add(1);
+            let mode = frame.mode.unwrap_or(FormatMode::Compact);
+            let depth = frame.depth;
 
             let mut indent_depth =
                 if matches!(mode, FormatMode::Compact) && self.format_buf.column() == 0 {
                     frame.events.first().and_then(|first| {
                         if first.is_array_value() {
                             Some(if first.is_scalar() {
-                                frame.depth
+                                depth
                             } else {
-                                frame.depth.saturating_sub(1)
+                                depth.saturating_sub(1)
                             })
                         } else {
                             None
@@ -356,7 +366,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     None
                 };
 
-            let mut events = frame.events;
+            let mut events = mem::take(&mut frame.events);
             for event in events.drain(..) {
                 // expansion stack should take precedence over frame
                 match mode {
@@ -364,7 +374,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                         ExpandedEmitter {
                             buf: &mut self.format_buf,
                         }
-                        .emit_event(event, frame.depth);
+                        .emit_event(event, depth);
                     }
                     FormatMode::Compact => {
                         if let Some(depth) = indent_depth.take() {
@@ -379,9 +389,22 @@ impl<'a> PrettifyEmitVisitor<'a> {
             }
             self.event_pool.push(events);
         }
+
+        if self.frame_head > 0 {
+            self.frames.drain(..self.frame_head);
+            self.frame_head = 0;
+        }
     }
 
-    fn push_frame(&mut self, event: Event<'a>, depth: usize, owner_id: usize) {
+    fn push_frame(
+        &mut self,
+        event: Event<'a>,
+        depth: usize,
+        owner_id: usize,
+        event_len: usize,
+        has_array: bool,
+        has_object: bool,
+    ) {
         let mut events = self
             .event_pool
             .pop()
@@ -393,39 +416,46 @@ impl<'a> PrettifyEmitVisitor<'a> {
             depth, // snapshot depth
             bytes_available: self.current_available_bytes(),
             owner_id,
+            has_array,
+            has_object,
             ..Frame::default()
         };
 
-        let len = self.format_buf.event_len(&frame.events[0]);
-        frame.bytes_available = frame.bytes_available.saturating_sub(len);
+        frame.bytes_available = frame.bytes_available.saturating_sub(event_len);
 
-        self.frames.push_back(frame);
+        self.frames.push(frame);
     }
 
     /// decides whether event should be in same frame or not
-    fn push_event(&mut self, event: Event<'a>, depth: usize, owner_id: usize) {
-        let Some(last_frame) = self.frames.back_mut() else {
-            self.push_frame(event, depth, owner_id);
+    fn push_event(&mut self, event: Event<'a>, depth: usize, owner_id: usize, event_len: usize) {
+        let is_array = event.is_array();
+        let is_object = event.is_object();
+        let Some(last_frame) = self.frames.last_mut() else {
+            self.push_frame(event, depth, owner_id, event_len, is_array, is_object);
             return;
         };
 
         if last_frame.owner_id != owner_id {
-            self.push_frame(event, depth, owner_id);
+            self.push_frame(event, depth, owner_id, event_len, is_array, is_object);
             return;
         }
 
         let should_split = matches!(
             event,
             Event::ArrayOpen { .. } | Event::ObjectOpen { .. } | Event::ArrayClose
-        ) || (event.is_object()
-            && last_frame.events.iter().any(|x| x.is_array()))
-            || (event.is_array() && last_frame.events.iter().any(|x| x.is_object()));
+        ) || (event.is_object() && last_frame.has_array)
+            || (event.is_array() && last_frame.has_object);
 
         if should_split {
-            self.push_frame(event, depth, owner_id);
+            self.push_frame(event, depth, owner_id, event_len, is_array, is_object);
         } else {
-            let len = self.format_buf.event_len(&event);
-            last_frame.push(event, len);
+            last_frame.push(event, event_len);
+            if is_array {
+                last_frame.has_array = true;
+            }
+            if is_object {
+                last_frame.has_object = true;
+            }
         }
     }
 
@@ -482,7 +512,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
         }
 
         self.frames
-            .back()
+            .last()
             .map(|frame| frame.bytes_available)
             .unwrap_or_else(|| self.format_buf.available_bytes())
     }
@@ -556,13 +586,10 @@ impl<'a> PrettifyEmitVisitor<'a> {
             Event::ObjectKey { key } => self.depth.on_object_key(key),
             Event::KeyValDelim => self.depth.on_object_key_val_delim(),
             Event::ItemDelim => self.depth.on_item_delim(),
-            Event::Null { is_array_value } => self.depth.on_null(*is_array_value),
-            Event::String { s, is_array_value } => self.depth.on_string(s, *is_array_value),
-            Event::Number { n, is_array_value } => self.depth.on_number(n.clone(), *is_array_value),
-            Event::Boolean {
-                value,
-                is_array_value,
-            } => self.depth.on_boolean(*value, *is_array_value),
+            Event::Null { is_array_value }
+            | Event::String { is_array_value, .. }
+            | Event::Number { is_array_value, .. }
+            | Event::Boolean { is_array_value, .. } => self.depth.on_scalar(*is_array_value),
         }
 
         let current_depth = self.depth.current_depth();
@@ -589,7 +616,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 let owner_id =
                     self.open_container(layout::FrameKind::Object, self.current_available_bytes());
                 self.record_inline_len(event_len);
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
             }
             Event::ArrayOpen { .. } => {
                 self.mark_current_array_non_empty();
@@ -605,7 +632,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     self.current_available_bytes()
                 };
                 let owner_id = self.open_container(layout::FrameKind::Array, available_bytes);
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
             }
             Event::ObjectKey { key } => {
                 self.record_inline_len(event_len);
@@ -623,12 +650,12 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     prefix_len >= self.format_buf.preferred_width,
                     prefix_len,
                 );
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
             }
             Event::ObjectClose => {
                 let owner_id = self.current_container_id();
                 self.record_inline_len(event_len);
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
                 if let Some(closed) = self.close_container() {
                     self.apply_container_layout(closed);
                 }
@@ -640,7 +667,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 {
                     self.record_inline_len(event_len);
                 }
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
                 if let Some(closed) = self.close_container() {
                     self.apply_container_layout(closed);
                 }
@@ -655,7 +682,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 if event_len > self.format_buf.preferred_width {
                     self.mark_current_child_expanded();
                 }
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
 
                 if owner_id == 0 {
                     let stats = layout::FrameStats {
@@ -677,12 +704,12 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 {
                     self.record_inline_len(event_len);
                 }
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
             }
             Event::KeyValDelim => {
                 let owner_id = self.current_container_id();
                 self.record_inline_len(event_len);
-                self.push_event(event, frame_depth, owner_id);
+                self.push_event(event, frame_depth, owner_id, event_len);
             }
         }
 
@@ -789,6 +816,8 @@ struct Frame<'a> {
     depth: usize,
     bytes_available: usize,
     owner_id: usize,
+    has_array: bool,
+    has_object: bool,
 }
 
 impl<'a> Frame<'a> {

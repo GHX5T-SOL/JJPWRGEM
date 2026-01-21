@@ -12,6 +12,10 @@ impl DepthVisitor {
         self.current_depth
     }
 
+    pub(crate) fn on_scalar(&mut self, _is_array_value: bool) {
+        self.set_current_depth(self.nested_depth());
+    }
+
     fn set_current_depth(&mut self, depth: usize) {
         self.current_depth = depth;
     }
