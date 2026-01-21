@@ -72,10 +72,15 @@ mod layout {
                 }
             }
             FrameKind::Array => {
+                let available_width = if stats.available_bytes == 0 {
+                    preferred_width
+                } else {
+                    stats.available_bytes
+                };
                 if stats.is_empty {
                     FormatMode::Compact
                 } else if stats.child_expanded
-                    || stats.inline_len > preferred_width
+                    || stats.inline_len > available_width
                     || stats.available_bytes == 0
                 {
                     FormatMode::Expanded
@@ -161,6 +166,7 @@ mod layout {
         pub fn mark_child_expanded(&mut self) {
             if let Some(frame) = self.stack.last_mut() {
                 frame.stats.child_expanded = true;
+                frame.stats.is_empty = false;
             }
         }
 
@@ -292,6 +298,7 @@ struct ContainerState {
     stats: layout::FrameStats,
     mode: Option<FormatMode>,
     line_overflow: bool,
+    line_prefix_len: usize,
 }
 
 struct PrettifyEmitVisitor<'a> {
@@ -438,17 +445,19 @@ impl<'a> PrettifyEmitVisitor<'a> {
             stats,
             mode: None,
             line_overflow: false,
+            line_prefix_len: 0,
         });
         id
     }
 
-    fn mark_object_line_overflow(&mut self, overflow: bool) {
+    fn mark_object_line_overflow(&mut self, overflow: bool, prefix_len: usize) {
         if let Some(container) = self
             .containers
             .last_mut()
             .filter(|container| container.kind == layout::FrameKind::Object)
         {
             container.line_overflow = overflow;
+            container.line_prefix_len = prefix_len;
         }
     }
 
@@ -458,6 +467,14 @@ impl<'a> PrettifyEmitVisitor<'a> {
             .filter(|container| container.kind == layout::FrameKind::Object)
             .map(|container| container.line_overflow)
             .unwrap_or(false)
+    }
+
+    fn parent_line_prefix_len(&self) -> usize {
+        self.containers
+            .last()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+            .map(|container| container.line_prefix_len)
+            .unwrap_or(0)
     }
 
     fn current_available_bytes(&self) -> usize {
@@ -602,11 +619,16 @@ impl<'a> PrettifyEmitVisitor<'a> {
                 self.mark_parent_array_non_empty();
                 let available_bytes = if self.parent_line_overflow() {
                     0
+                } else if self.containers.last().map(|container| container.kind)
+                    == Some(layout::FrameKind::Object)
+                {
+                    self.format_buf
+                        .preferred_width
+                        .saturating_sub(self.parent_line_prefix_len())
                 } else {
                     self.current_available_bytes()
                 };
                 let owner_id = self.open_container(layout::FrameKind::Array, available_bytes);
-                self.record_inline_len(event_len);
                 self.push_event(event, frame_depth, owner_id);
             }
             Event::ObjectKey { key } => {
@@ -621,7 +643,10 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     .indent_len(frame_depth)
                     .saturating_add(FormatBuf::quoted_len(key))
                     .saturating_add(self.format_buf.key_val_delim_len());
-                self.mark_object_line_overflow(prefix_len >= self.format_buf.preferred_width);
+                self.mark_object_line_overflow(
+                    prefix_len >= self.format_buf.preferred_width,
+                    prefix_len,
+                );
                 self.push_event(event, frame_depth, owner_id);
             }
             Event::ObjectClose => {
@@ -634,7 +659,11 @@ impl<'a> PrettifyEmitVisitor<'a> {
             }
             Event::ArrayClose => {
                 let owner_id = self.current_container_id();
-                self.record_inline_len(event_len);
+                if self.containers.last().map(|container| container.kind)
+                    != Some(layout::FrameKind::Array)
+                {
+                    self.record_inline_len(event_len);
+                }
                 self.push_event(event, frame_depth, owner_id);
                 if let Some(closed) = self.close_container() {
                     self.apply_container_layout(closed);
@@ -665,7 +694,16 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     self.set_container_mode(0, mode);
                 }
             }
-            Event::ItemDelim | Event::KeyValDelim => {
+            Event::ItemDelim => {
+                let owner_id = self.current_container_id();
+                if self.containers.last().map(|container| container.kind)
+                    != Some(layout::FrameKind::Array)
+                {
+                    self.record_inline_len(event_len);
+                }
+                self.push_event(event, frame_depth, owner_id);
+            }
+            Event::KeyValDelim => {
                 let owner_id = self.current_container_id();
                 self.record_inline_len(event_len);
                 self.push_event(event, frame_depth, owner_id);
@@ -1073,7 +1111,7 @@ mod tests {
             res,
             r#"
 [
-    0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006
+  0.4e00669999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999969999999006
 ]
             "#
             .trim()
