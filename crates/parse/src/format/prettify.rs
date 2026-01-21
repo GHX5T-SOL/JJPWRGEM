@@ -57,6 +57,7 @@ mod layout {
         pub key_count: usize,
         pub child_expanded: bool,
         pub is_empty: bool,
+        pub available_bytes: usize,
     }
 
     pub fn decide_layout(stats: FrameStats, preferred_width: usize) -> FormatMode {
@@ -73,7 +74,10 @@ mod layout {
             FrameKind::Array => {
                 if stats.is_empty {
                     FormatMode::Compact
-                } else if stats.child_expanded || stats.inline_len > preferred_width {
+                } else if stats.child_expanded
+                    || stats.inline_len > preferred_width
+                    || stats.available_bytes == 0
+                {
                     FormatMode::Expanded
                 } else {
                     FormatMode::Compact
@@ -130,6 +134,7 @@ mod layout {
                 key_count: 0,
                 child_expanded: false,
                 is_empty: true,
+                available_bytes: self.preferred_width,
             };
             self.stack.push(LayoutFrame { stats });
         }
@@ -170,6 +175,7 @@ mod layout {
                     key_count: 0,
                     child_expanded: false,
                     is_empty: true,
+                    available_bytes: self.preferred_width,
                 });
             decide_layout(stats, self.preferred_width).into()
         }
@@ -284,6 +290,8 @@ struct ContainerState {
     id: usize,
     kind: layout::FrameKind,
     stats: layout::FrameStats,
+    mode: Option<FormatMode>,
+    line_overflow: bool,
 }
 
 struct PrettifyEmitVisitor<'a> {
@@ -318,6 +326,23 @@ impl<'a> PrettifyEmitVisitor<'a> {
             let frame = self.frames.pop_front().unwrap();
             // dbg!(frame.depth);
 
+            let mut indent_depth =
+                if matches!(mode, FormatMode::Compact) && self.format_buf.column() == 0 {
+                    frame.events.first().and_then(|first| {
+                        if first.is_array_value() {
+                            Some(if first.is_scalar() {
+                                frame.depth
+                            } else {
+                                frame.depth.saturating_sub(1)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
             for event in frame.events.into_iter() {
                 // dbg!(&event);
                 // TODO maybe better to have a general emitter that has two branches???
@@ -331,6 +356,9 @@ impl<'a> PrettifyEmitVisitor<'a> {
                     }
                     FormatMode::Compact => {
                         // TODO new impl or fancy function
+                        if let Some(depth) = indent_depth.take() {
+                            self.format_buf.write_indent(depth);
+                        }
                         CompactEmitter {
                             buf: &mut self.format_buf,
                         }
@@ -344,8 +372,8 @@ impl<'a> PrettifyEmitVisitor<'a> {
     fn push_frame(&mut self, event: Event<'a>, depth: usize, owner_id: usize) {
         let mut frame = Frame {
             events: vec![],
-            depth,                                              // snapshot depth
-            bytes_available: self.format_buf.available_bytes(), // is this right here? can we assume everything has been flushed all the way for this line??????
+            depth, // snapshot depth
+            bytes_available: self.current_available_bytes(),
             owner_id,
             ..Frame::default()
         };
@@ -393,7 +421,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
             .unwrap_or(0)
     }
 
-    fn open_container(&mut self, kind: layout::FrameKind) -> usize {
+    fn open_container(&mut self, kind: layout::FrameKind, available_bytes: usize) -> usize {
         let id = self.next_container_id;
         self.next_container_id = self.next_container_id.saturating_add(1);
         let stats = layout::FrameStats {
@@ -402,9 +430,46 @@ impl<'a> PrettifyEmitVisitor<'a> {
             key_count: 0,
             child_expanded: false,
             is_empty: true,
+            available_bytes,
         };
-        self.containers.push(ContainerState { id, kind, stats });
+        self.containers.push(ContainerState {
+            id,
+            kind,
+            stats,
+            mode: None,
+            line_overflow: false,
+        });
         id
+    }
+
+    fn mark_object_line_overflow(&mut self, overflow: bool) {
+        if let Some(container) = self
+            .containers
+            .last_mut()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+        {
+            container.line_overflow = overflow;
+        }
+    }
+
+    fn parent_line_overflow(&self) -> bool {
+        self.containers
+            .last()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+            .map(|container| container.line_overflow)
+            .unwrap_or(false)
+    }
+
+    fn current_available_bytes(&self) -> usize {
+        if self.containers.last().and_then(|container| container.mode) == Some(FormatMode::Expanded)
+        {
+            return self.format_buf.available_bytes();
+        }
+
+        self.frames
+            .back()
+            .map(|frame| frame.bytes_available)
+            .unwrap_or_else(|| self.format_buf.available_bytes())
     }
 
     fn close_container(&mut self) -> Option<ContainerState> {
@@ -437,11 +502,15 @@ impl<'a> PrettifyEmitVisitor<'a> {
         }
     }
 
-    fn increment_key_count(&mut self) {
+    fn increment_key_count(&mut self) -> bool {
         if let Some(container) = self.containers.last_mut() {
+            let was_empty = container.stats.key_count == 0;
             container.stats.key_count = container.stats.key_count.saturating_add(1);
             container.stats.is_empty = false;
+            return was_empty;
         }
+
+        false
     }
 
     fn mark_current_child_expanded(&mut self) {
@@ -455,6 +524,14 @@ impl<'a> PrettifyEmitVisitor<'a> {
             if frame.owner_id == id {
                 frame.mode = Some(mode);
             }
+        }
+
+        if let Some(container) = self
+            .containers
+            .iter_mut()
+            .find(|container| container.id == id)
+        {
+            container.mode = Some(mode);
         }
     }
 
@@ -516,20 +593,35 @@ impl<'a> PrettifyEmitVisitor<'a> {
         match event {
             Event::ObjectOpen { .. } => {
                 self.mark_parent_array_non_empty();
-                let owner_id = self.open_container(layout::FrameKind::Object);
+                let owner_id =
+                    self.open_container(layout::FrameKind::Object, self.current_available_bytes());
                 self.record_inline_len(event_len);
                 self.push_event(event, frame_depth, owner_id);
             }
             Event::ArrayOpen { .. } => {
                 self.mark_parent_array_non_empty();
-                let owner_id = self.open_container(layout::FrameKind::Array);
+                let available_bytes = if self.parent_line_overflow() {
+                    0
+                } else {
+                    self.current_available_bytes()
+                };
+                let owner_id = self.open_container(layout::FrameKind::Array, available_bytes);
                 self.record_inline_len(event_len);
                 self.push_event(event, frame_depth, owner_id);
             }
-            Event::ObjectKey { .. } => {
+            Event::ObjectKey { key } => {
                 self.record_inline_len(event_len);
-                self.increment_key_count();
+                let first_key = self.increment_key_count();
                 let owner_id = self.current_container_id();
+                if first_key {
+                    self.set_container_mode(owner_id, FormatMode::Expanded);
+                }
+                let prefix_len = self
+                    .format_buf
+                    .indent_len(frame_depth)
+                    .saturating_add(FormatBuf::quoted_len(key))
+                    .saturating_add(self.format_buf.key_val_delim_len());
+                self.mark_object_line_overflow(prefix_len >= self.format_buf.preferred_width);
                 self.push_event(event, frame_depth, owner_id);
             }
             Event::ObjectClose => {
@@ -567,6 +659,7 @@ impl<'a> PrettifyEmitVisitor<'a> {
                         key_count: 0,
                         child_expanded: false,
                         is_empty: false,
+                        available_bytes: self.current_available_bytes(),
                     };
                     let mode = layout::decide_layout(stats, self.format_buf.preferred_width);
                     self.set_container_mode(0, mode);
@@ -789,6 +882,13 @@ impl FormatBuf {
 
     pub fn write_indent(&mut self, level: usize) {
         self.write_spec(self.opts.indent.map(|(c, size)| (c, size * level)));
+    }
+
+    pub fn indent_len(&self, level: usize) -> usize {
+        self.opts
+            .indent
+            .map(|(_, size)| size.saturating_mul(level))
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -1063,6 +1163,7 @@ mod tests {
             key_count: 1,
             child_expanded: false,
             is_empty: false,
+            available_bytes: 80,
         };
 
         assert_eq!(decide_layout(stats, 80), FormatMode::Expanded);
@@ -1076,6 +1177,7 @@ mod tests {
             key_count: 0,
             child_expanded: false,
             is_empty: true,
+            available_bytes: 80,
         };
 
         assert_eq!(decide_layout(stats, 0), FormatMode::Compact);
@@ -1089,6 +1191,7 @@ mod tests {
             key_count: 0,
             child_expanded: true,
             is_empty: false,
+            available_bytes: 80,
         };
         let width_overflow = FrameStats {
             kind: FrameKind::Array,
@@ -1096,6 +1199,7 @@ mod tests {
             key_count: 0,
             child_expanded: false,
             is_empty: false,
+            available_bytes: 5,
         };
 
         assert_eq!(decide_layout(child_expanded, 80), FormatMode::Expanded);
@@ -1110,6 +1214,7 @@ mod tests {
             key_count: 0,
             child_expanded: false,
             is_empty: true,
+            available_bytes: 80,
         };
 
         assert_eq!(decide_layout(stats, 0), FormatMode::Compact);
@@ -1123,6 +1228,7 @@ mod tests {
             key_count: 0,
             child_expanded: false,
             is_empty: false,
+            available_bytes: 80,
         };
 
         assert_eq!(decide_layout(stats, 5), FormatMode::Expanded);
