@@ -322,6 +322,478 @@ struct PrettifyEmitVisitor<'a> {
     layout: layout::LayoutTracker,
 }
 
+struct LayoutOnlyVisitor<'a> {
+    containers: Vec<ContainerState>,
+    container_modes: Vec<Option<FormatMode>>,
+    next_container_id: usize,
+    format_buf: FormatBuf,
+    depth: DepthVisitor,
+    layout: layout::LayoutTracker,
+    phantom: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> LayoutOnlyVisitor<'a> {
+    fn new(format_buf: FormatBuf) -> Self {
+        let preferred_width = format_buf.preferred_width;
+        Self {
+            containers: Vec::new(),
+            container_modes: vec![None],
+            next_container_id: 1,
+            format_buf,
+            depth: DepthVisitor::default(),
+            layout: layout::LayoutTracker::new(preferred_width),
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    fn current_container_id(&self) -> usize {
+        self.containers
+            .last()
+            .map(|container| container.id)
+            .unwrap_or(0)
+    }
+
+    fn open_container(&mut self, kind: layout::FrameKind, available_bytes: usize) -> usize {
+        let id = self.next_container_id;
+        self.next_container_id = self.next_container_id.saturating_add(1);
+        if self.container_modes.len() <= id {
+            self.container_modes.push(None);
+        } else {
+            self.container_modes[id] = None;
+        }
+        self.layout.open_frame(kind, available_bytes);
+        self.containers.push(ContainerState {
+            id,
+            kind,
+            mode: None,
+            line_overflow: false,
+            line_prefix_len: 0,
+        });
+        id
+    }
+
+    fn close_container(&mut self) -> Option<ContainerState> {
+        self.containers.pop()
+    }
+
+    fn record_inline_len(&mut self, inline_len: usize) {
+        self.layout.record_inline_len(inline_len);
+    }
+
+    fn mark_current_array_non_empty(&mut self) {
+        if self
+            .containers
+            .last_mut()
+            .filter(|container| container.kind == layout::FrameKind::Array)
+            .is_some()
+        {
+            self.layout.mark_non_empty();
+        }
+    }
+
+    fn increment_key_count(&mut self) -> bool {
+        self.layout.increment_key_count()
+    }
+
+    fn mark_current_child_expanded(&mut self) {
+        self.layout.mark_child_expanded();
+        if let Some(id) = self
+            .containers
+            .last()
+            .map(|container| (container.id, container.kind, container.mode))
+            .filter(|(_, kind, mode)| {
+                *kind == layout::FrameKind::Array && *mode != Some(FormatMode::Expanded)
+            })
+            .map(|(id, _, _)| id)
+        {
+            self.set_container_mode(id, FormatMode::Expanded);
+        }
+    }
+
+    fn set_container_mode(&mut self, id: usize, mode: FormatMode) {
+        if let Some(slot) = self.container_modes.get_mut(id) {
+            *slot = Some(mode);
+        }
+
+        if let Some(container) = self
+            .containers
+            .iter_mut()
+            .find(|container| container.id == id)
+        {
+            container.mode = Some(mode);
+        }
+    }
+
+    fn apply_container_layout(&mut self, closed: ContainerState) {
+        let (decision, stats) = self.layout.close_frame();
+        let mode = FormatMode::from(decision);
+        self.set_container_mode(closed.id, mode);
+
+        if self.containers.last().is_some() {
+            match mode {
+                FormatMode::Expanded => {
+                    self.layout.mark_child_expanded();
+                }
+                FormatMode::Compact => {
+                    self.layout.record_inline_len(stats.inline_len);
+                }
+            }
+        }
+    }
+
+    fn mark_object_line_overflow(&mut self, overflow: bool, prefix_len: usize) {
+        if let Some(container) = self
+            .containers
+            .last_mut()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+        {
+            container.line_overflow = overflow;
+            container.line_prefix_len = prefix_len;
+        }
+    }
+
+    fn parent_line_overflow(&self) -> bool {
+        self.containers
+            .last()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+            .is_some_and(|container| container.line_overflow)
+    }
+
+    fn parent_line_prefix_len(&self) -> usize {
+        self.containers
+            .last()
+            .filter(|container| container.kind == layout::FrameKind::Object)
+            .map_or(0, |container| container.line_prefix_len)
+    }
+
+    fn current_available_bytes(&self) -> usize {
+        if self.containers.last().and_then(|container| container.mode) == Some(FormatMode::Expanded)
+        {
+            return self.format_buf.available_bytes();
+        }
+
+        self.format_buf.available_bytes()
+    }
+
+    fn update_depth(&mut self, event: &Event<'a>) {
+        match event {
+            Event::ArrayOpen { is_array_value } => self.depth.on_array_open(*is_array_value),
+            Event::ArrayClose => self.depth.on_array_close(),
+            Event::ObjectOpen { is_array_value } => self.depth.on_object_open(*is_array_value),
+            Event::ObjectClose => self.depth.on_object_close(),
+            Event::ObjectKey { key } => self.depth.on_object_key(key),
+            Event::KeyValDelim => self.depth.on_object_key_val_delim(),
+            Event::ItemDelim => self.depth.on_item_delim(),
+            Event::Null { is_array_value }
+            | Event::String { is_array_value, .. }
+            | Event::Number { is_array_value, .. }
+            | Event::Boolean { is_array_value, .. } => self.depth.on_scalar(*is_array_value),
+        }
+    }
+
+    fn on_event(&mut self, event: Event<'a>) {
+        self.update_depth(&event);
+        let event_len = self.format_buf.event_len(&event);
+
+        match event {
+            Event::ObjectOpen { .. } => {
+                self.mark_current_array_non_empty();
+                let owner_id =
+                    self.open_container(layout::FrameKind::Object, self.current_available_bytes());
+                self.record_inline_len(event_len);
+                if owner_id == 0 {
+                    self.set_container_mode(0, FormatMode::Expanded);
+                }
+            }
+            Event::ArrayOpen { .. } => {
+                self.mark_current_array_non_empty();
+                let available_bytes = if self.parent_line_overflow() {
+                    0
+                } else if self.containers.last().map(|container| container.kind)
+                    == Some(layout::FrameKind::Object)
+                {
+                    self.format_buf
+                        .preferred_width
+                        .saturating_sub(self.parent_line_prefix_len())
+                } else {
+                    self.current_available_bytes()
+                };
+                self.open_container(layout::FrameKind::Array, available_bytes);
+            }
+            Event::ObjectKey { key } => {
+                self.record_inline_len(event_len);
+                let first_key = self.increment_key_count();
+                let owner_id = self.current_container_id();
+                if first_key {
+                    self.set_container_mode(owner_id, FormatMode::Expanded);
+                }
+                let prefix_len = self
+                    .format_buf
+                    .indent_len(self.depth.current_depth().saturating_sub(1))
+                    .saturating_add(FormatBuf::quoted_len(key))
+                    .saturating_add(self.format_buf.key_val_delim_len());
+                self.mark_object_line_overflow(
+                    prefix_len >= self.format_buf.preferred_width,
+                    prefix_len,
+                );
+            }
+            Event::ObjectClose => {
+                self.record_inline_len(event_len);
+                if let Some(closed) = self.close_container() {
+                    self.apply_container_layout(closed);
+                }
+            }
+            Event::ArrayClose => {
+                if self.containers.last().map(|container| container.kind)
+                    != Some(layout::FrameKind::Array)
+                {
+                    self.record_inline_len(event_len);
+                }
+                if let Some(closed) = self.close_container() {
+                    self.apply_container_layout(closed);
+                }
+            }
+            Event::Boolean { .. }
+            | Event::Null { .. }
+            | Event::Number { .. }
+            | Event::String { .. } => {
+                let owner_id = self.current_container_id();
+                self.record_inline_len(event_len);
+                self.mark_current_array_non_empty();
+                if event_len > self.format_buf.preferred_width {
+                    self.mark_current_child_expanded();
+                }
+
+                if owner_id == 0 {
+                    let stats = layout::FrameStats {
+                        kind: layout::FrameKind::Scalar,
+                        inline_len: event_len,
+                        key_count: 0,
+                        child_expanded: false,
+                        is_empty: false,
+                        available_bytes: self.current_available_bytes(),
+                    };
+                    let mode = layout::decide_layout(stats, self.format_buf.preferred_width);
+                    self.set_container_mode(0, mode);
+                }
+            }
+            Event::ItemDelim => {
+                if self.containers.last().map(|container| container.kind)
+                    != Some(layout::FrameKind::Array)
+                {
+                    self.record_inline_len(event_len);
+                }
+            }
+            Event::KeyValDelim => {
+                self.record_inline_len(event_len);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<Option<FormatMode>> {
+        self.container_modes
+    }
+}
+
+impl<'a> Visitor<'a> for LayoutOnlyVisitor<'a> {
+    fn on_array_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ArrayOpen { is_array_value });
+    }
+
+    fn on_array_close(&mut self) {
+        self.on_event(Event::ArrayClose);
+    }
+
+    fn on_object_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ObjectOpen { is_array_value });
+    }
+
+    fn on_object_close(&mut self) {
+        self.on_event(Event::ObjectClose);
+    }
+
+    fn on_null(&mut self, is_array_value: bool) {
+        self.on_event(Event::Null { is_array_value });
+    }
+
+    fn on_string(&mut self, s: &'a str, is_array_value: bool) {
+        self.on_event(Event::String { s, is_array_value });
+    }
+
+    fn on_number(&mut self, n: Cow<'a, str>, is_array_value: bool) {
+        self.on_event(Event::Number { n, is_array_value });
+    }
+
+    fn on_boolean(&mut self, b: bool, is_array_value: bool) {
+        self.on_event(Event::Boolean {
+            value: b,
+            is_array_value,
+        });
+    }
+
+    fn on_item_delim(&mut self) {
+        self.on_event(Event::ItemDelim);
+    }
+
+    fn on_object_key_val_delim(&mut self) {
+        self.on_event(Event::KeyValDelim);
+    }
+
+    fn on_object_key(&mut self, key: &'a str) {
+        self.on_event(Event::ObjectKey { key });
+    }
+}
+
+struct DirectEmitVisitor {
+    format_buf: FormatBuf,
+    depth: DepthVisitor,
+    container_modes: Vec<Option<FormatMode>>,
+    container_stack: Vec<usize>,
+    next_container_id: usize,
+}
+
+impl DirectEmitVisitor {
+    fn new(format_buf: FormatBuf, container_modes: Vec<Option<FormatMode>>) -> Self {
+        Self {
+            format_buf,
+            depth: DepthVisitor::default(),
+            container_modes,
+            container_stack: Vec::new(),
+            next_container_id: 1,
+        }
+    }
+
+    fn current_container_id(&self) -> usize {
+        self.container_stack.last().copied().unwrap_or(0)
+    }
+
+    fn current_mode(&self) -> FormatMode {
+        self.container_modes
+            .get(self.current_container_id())
+            .and_then(|mode| *mode)
+            .unwrap_or(FormatMode::Compact)
+    }
+
+    fn update_depth_and_frame_depth(&mut self, event: &Event<'_>) -> usize {
+        match event {
+            Event::ArrayOpen { is_array_value } => self.depth.on_array_open(*is_array_value),
+            Event::ArrayClose => self.depth.on_array_close(),
+            Event::ObjectOpen { is_array_value } => self.depth.on_object_open(*is_array_value),
+            Event::ObjectClose => self.depth.on_object_close(),
+            Event::ObjectKey { key } => self.depth.on_object_key(key),
+            Event::KeyValDelim => self.depth.on_object_key_val_delim(),
+            Event::ItemDelim => self.depth.on_item_delim(),
+            Event::Null { is_array_value }
+            | Event::String { is_array_value, .. }
+            | Event::Number { is_array_value, .. }
+            | Event::Boolean { is_array_value, .. } => self.depth.on_scalar(*is_array_value),
+        }
+
+        let current_depth = self.depth.current_depth();
+        match event {
+            Event::ArrayOpen { .. }
+            | Event::ArrayClose
+            | Event::ObjectOpen { .. }
+            | Event::ObjectClose => current_depth,
+            _ => current_depth.saturating_sub(1),
+        }
+    }
+
+    fn emit_with_mode(&mut self, event: Event<'_>, depth: usize, mode: FormatMode) {
+        match mode {
+            FormatMode::Expanded => ExpandedEmitter {
+                buf: &mut self.format_buf,
+            }
+            .emit_event(event, depth),
+            FormatMode::Compact => CompactEmitter {
+                buf: &mut self.format_buf,
+            }
+            .emit_event(event),
+        }
+    }
+
+    fn on_event(&mut self, event: Event<'_>) {
+        let depth = self.update_depth_and_frame_depth(&event);
+        match event {
+            Event::ArrayOpen { .. } | Event::ObjectOpen { .. } => {
+                let id = self.next_container_id;
+                self.next_container_id = self.next_container_id.saturating_add(1);
+                self.container_stack.push(id);
+                let mode = self.current_mode();
+                self.emit_with_mode(event, depth, mode);
+            }
+            Event::ArrayClose | Event::ObjectClose => {
+                let mode = self.current_mode();
+                self.emit_with_mode(event, depth, mode);
+                self.container_stack.pop();
+            }
+            Event::ObjectKey { .. }
+            | Event::KeyValDelim
+            | Event::ItemDelim
+            | Event::Boolean { .. }
+            | Event::Null { .. }
+            | Event::Number { .. }
+            | Event::String { .. } => {
+                let mode = self.current_mode();
+                self.emit_with_mode(event, depth, mode);
+            }
+        }
+    }
+
+    fn finish(self) -> String {
+        self.format_buf.buf
+    }
+}
+
+impl<'a> Visitor<'a> for DirectEmitVisitor {
+    fn on_array_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ArrayOpen { is_array_value });
+    }
+
+    fn on_array_close(&mut self) {
+        self.on_event(Event::ArrayClose);
+    }
+
+    fn on_object_open(&mut self, is_array_value: bool) {
+        self.on_event(Event::ObjectOpen { is_array_value });
+    }
+
+    fn on_object_close(&mut self) {
+        self.on_event(Event::ObjectClose);
+    }
+
+    fn on_null(&mut self, is_array_value: bool) {
+        self.on_event(Event::Null { is_array_value });
+    }
+
+    fn on_string(&mut self, s: &'a str, is_array_value: bool) {
+        self.on_event(Event::String { s, is_array_value });
+    }
+
+    fn on_number(&mut self, n: Cow<'a, str>, is_array_value: bool) {
+        self.on_event(Event::Number { n, is_array_value });
+    }
+
+    fn on_boolean(&mut self, b: bool, is_array_value: bool) {
+        self.on_event(Event::Boolean {
+            value: b,
+            is_array_value,
+        });
+    }
+
+    fn on_item_delim(&mut self) {
+        self.on_event(Event::ItemDelim);
+    }
+
+    fn on_object_key_val_delim(&mut self) {
+        self.on_event(Event::KeyValDelim);
+    }
+
+    fn on_object_key(&mut self, key: &'a str) {
+        self.on_event(Event::ObjectKey { key });
+    }
+}
+
 const EVENT_POOL_MIN_CAPACITY: usize = 8;
 
 impl<'a> PrettifyEmitVisitor<'a> {
@@ -1088,12 +1560,16 @@ pub fn format_str<'a>(
     options: FormatOptions,
     preferred_width: usize,
 ) -> Result<'a, String> {
-    let buf = FormatBuf::new(String::with_capacity(json.len()), options, preferred_width);
+    let layout_buf = FormatBuf::new(String::new(), options, preferred_width);
+    let mut layout_visitor = LayoutOnlyVisitor::new(layout_buf);
+    parse_tokens(json, &mut layout_visitor)?;
+    let container_modes = layout_visitor.finish();
 
-    let mut visitor = PrettifyEmitVisitor::new(buf);
-    parse_tokens(json, &mut visitor)?;
+    let emit_buf = FormatBuf::new(String::with_capacity(json.len()), options, preferred_width);
+    let mut emit_visitor = DirectEmitVisitor::new(emit_buf, container_modes);
+    parse_tokens(json, &mut emit_visitor)?;
 
-    Ok(visitor.finish())
+    Ok(emit_visitor.finish())
 }
 
 pub fn format_value(val: &Value, options: &FormatOptions, preferred_width: usize) -> String {
