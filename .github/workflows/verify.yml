@@ -40,10 +40,13 @@ jobs:
       - uses: ./.github/actions/setup-mise
       - name: Configure Dependency Caching
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: audit licenses, advisories, bans, and sources
+        run: mise run deny
       - name: verify publish contents
         run: mise run diet
       - run: mise run lint
       - run: mise run readmes-check
+      - run: mise run typos
       - run: mise run package-json-check
       - run: mise run tracey-check
 
